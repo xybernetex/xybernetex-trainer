@@ -16,13 +16,16 @@ interventions:
   - "normal": varied, unrelated, successful tool calls - mostly CONTINUE
   - "stuck_loop": the same tool+params repeated 4 times in a row somewhere
     in the episode - exercises REPLAN
-  - "error_recovery": 3 consecutive failures somewhere in the episode
+  - "error_recovery": 2-7 consecutive failures somewhere in the episode
     (different params each, so this doesn't also trigger repeat-detection) -
-    exercises INJECT_CONTEXT-then-REQUEST_USER as failures accumulate
+    exercises INJECT_CONTEXT-then-REQUEST_USER as failures accumulate, and
+    (at 5+) the escalation holding once consecutive_error_count saturates
   - "risky_tool": one destructive or sensitive call somewhere in the episode
     - exercises BLOCK_ACTION / REQUEST_USER
   - "budget_exhaustion": either the step budget or the cost budget (chosen
-    per episode) is sized to run out right at the end - exercises TERMINATE
+    per episode) is sized to run out partway through, with several steps
+    still running afterward while it stays exhausted - exercises TERMINATE,
+    including with TERMINATE already in the episode's own action history
 
 Every episode draws its own length, trigger position, cost-per-step, and
 budget sizes. An earlier version fixed all of these (20 steps, trigger always
@@ -35,6 +38,28 @@ history state, so the dataset couldn't distinguish "learned the causal
 feature" from "learned the position." Non-budget categories now keep at least
 half their cost budget and two thirds of their step budget, so only
 budget_exhaustion episodes ever reach TERMINATE.
+
+A second real problem, found from live data rather than code review
+(2026-09-25, the full-run1 scenario batch plus an offline ablation against
+the deployed checkpoint - see xybernetex-openclaw/ALPHA.md and the
+architecture doc): both budget_exhaustion and error_recovery episodes ended
+at (or immediately after) their own trigger, so the model never trained on
+what its OWN recommendation looks like once it's already in
+recent_actions - exactly what happens in real observe-only deployment, since
+nothing there ever stops a run. The ablation showed this precisely: on an
+otherwise-identical real state, P(TERMINATE) jumped from 0.56 to 0.94 the
+instant one prior TERMINATE appeared in the 16-slot action history, and
+saturated immediately after - a hard switch the model had never been trained
+against, not a gradient it learned. budget_exhaustion's trigger now lands
+partway through the episode (not at the very end), so several further steps
+run on afterward with the budget still exhausted and TERMINATE already
+sitting in recent_actions - including step_number exceeding max_steps, which
+real OpenClaw runs do (nothing hard-stops a run at its reported budget
+either). error_recovery's streak length is now drawn from [2, 7] instead of
+fixed at 3, so training actually reaches consecutive_error_count's
+normalization cap (5) - real streaks of 6-8 had the model confidently
+predicting the wrong action, worse the longer the streak ran, because it had
+only ever seen exactly 3.
 """
 from __future__ import annotations
 
@@ -56,7 +81,17 @@ _SENSITIVE_TOOLS: tuple[str, ...] = ("send_email", "publish_post", "transfer_fun
 _MIN_EPISODE_LENGTH: int = 12
 _MAX_EPISODE_LENGTH: int = 30
 _STUCK_RUN: int = 4
-_ERROR_RUN: int = 3
+# Was fixed at 3: state_vectorizer.py's consecutive_error_count feature
+# normalizes by _MAX_CONSECUTIVE_ERRORS=5, so a streak of exactly 3 (0.6)
+# never reached the saturated region (streaks >=5, all 1.0) that real long
+# streaks land in - see the module docstring's 2026-09-25 note.
+_ERROR_RUN_MIN: int = 2
+_ERROR_RUN_MAX: int = 7
+# Floor on how many steps a budget_exhaustion episode keeps running once its
+# budget first hits the teacher's TERMINATE threshold - see the module
+# docstring. _episode_budgets derives the actual (variable) continuation
+# length from this and the episode's own length.
+_BUDGET_CONTINUATION_MIN: int = 2
 _CATEGORIES: tuple[str, ...] = ("normal", "stuck_loop", "error_recovery", "risky_tool", "budget_exhaustion")
 
 
@@ -74,8 +109,9 @@ def _build_episode_history(category: str, rng: random.Random, length: int) -> li
         for i in range(start, start + _STUCK_RUN):
             history[i] = ToolCallRecord(tool_name=stuck.tool_name, params=stuck.params, success=True)
     elif category == "error_recovery":
-        start = rng.randint(0, length - _ERROR_RUN)
-        for i in range(start, start + _ERROR_RUN):
+        run_len = rng.randint(_ERROR_RUN_MIN, _ERROR_RUN_MAX)
+        start = rng.randint(0, length - run_len)
+        for i in range(start, start + run_len):
             history[i] = _random_call(rng, success=False)
     elif category == "risky_tool":
         history[rng.randrange(length)] = _random_call(rng, risky_pool=_DESTRUCTIVE_TOOLS + _SENSITIVE_TOOLS)
@@ -86,15 +122,47 @@ def _episode_budgets(category: str, rng: random.Random, length: int) -> tuple[in
     """Returns (max_steps, cost_per_step, cost_budget). Only budget_exhaustion
     episodes are sized to run out; everything else ends with at least 2/3 of
     its step budget and 1/2 of its cost budget left, comfortably clear of the
-    teacher's TERMINATE threshold."""
+    teacher's TERMINATE threshold.
+
+    budget_exhaustion's trigger lands partway through the episode, not at (or
+    one step before) its very end, so continuation steps actually exist with
+    the budget already exhausted and TERMINATE already in recent_actions -
+    see the module docstring's 2026-09-25 note. The step-budget branch lets
+    step_number run past max_steps for those continuation steps, same as real
+    OpenClaw runs (nothing there hard-stops a run at its reported budget
+    either) - state_vectorizer.py's s[1] goes negative and stays a clean
+    TERMINATE signal; nothing clips it, deliberately."""
     cost_per_step = rng.uniform(0.1, 1.0)
     generous_cost = cost_per_step * length * rng.uniform(2.0, 5.0)
     generous_steps = length * rng.randint(3, 6)
     if category != "budget_exhaustion":
+        if rng.random() < 0.4:
+            # Tight but safe: stays clear of the teacher's exhaustion
+            # threshold, but reaches into the 65-87% used zone other
+            # categories otherwise never touch at all (a "generous" budget
+            # never exceeds ~33% used across the episode's real length).
+            # Without this, budget_exhaustion's own thin pre-trigger ramp
+            # was the ONLY source of genuinely-CONTINUE examples in that
+            # zone - too sparse to balance the extra TERMINATE mass the
+            # post-trigger continuation fix adds there, which pulled the
+            # model's decision boundary earlier than the teacher's true 90%
+            # cutoff even after that fix worked as intended. See the module
+            # docstring's 2026-09-25 note.
+            denom = length / (1 - rng.uniform(0.13, 0.35))
+            return max(length + 1, round(denom)), cost_per_step, cost_per_step * denom
         return generous_steps, cost_per_step, generous_cost
+    # Trigger in the episode's last third: an offline retrain+ablation
+    # (2026-09-25) found that letting the trigger land anywhere - including
+    # very early in short episodes - starved training of genuine "70-90%
+    # used, still CONTINUE" examples and shifted the model's decision
+    # boundary earlier than the teacher's true 90% cutoff, trading the
+    # history lock-in bug for a worse budget-calibration one. Keeping most
+    # of the episode as a gradual, correctly-labeled approach avoids that
+    # while still leaving room for genuine post-trigger continuation.
+    trigger_step = max(2, min(length - _BUDGET_CONTINUATION_MIN, round(length * rng.uniform(0.65, 0.85))))
     if rng.random() < 0.5:
-        return length, cost_per_step, generous_cost                       # step budget runs out
-    return generous_steps, cost_per_step, cost_per_step * length * rng.uniform(0.85, 1.0)  # cost runs out
+        return trigger_step, cost_per_step, generous_cost                 # step budget runs out
+    return generous_steps, cost_per_step, cost_per_step * trigger_step    # cost budget runs out
 
 
 def episode_snapshots(category: str, rng: random.Random) -> list[tuple[TrajectorySnapshot, int]]:

@@ -61,6 +61,67 @@ class TestSyntheticGenerator(unittest.TestCase):
                                    if ActionSpace.decode(a) in ("BLOCK_ACTION", "REQUEST_USER"))
         self.assertGreater(len(block_positions), 10)
 
+    def test_error_recovery_streak_length_varies_and_reaches_saturation(self):
+        """Regression test for a live-data finding (2026-09-25, full-run1 +
+        offline ablation - see the module docstring): the streak was fixed at
+        exactly 3, so consecutive_error_count's normalization cap of 5 was
+        never reached in training, and the model was confidently wrong on
+        real streaks of 6-8, worse the longer the streak ran."""
+        rng = random.Random(0)
+        lengths = set()
+        for _ in range(200):
+            history = gen._build_episode_history("error_recovery", rng, length=20)
+            best = cur = 0
+            for call in history:
+                cur = cur + 1 if not call.success else 0
+                best = max(best, cur)
+            lengths.add(best)
+        self.assertTrue(lengths & {2, 3, 4}, f"no sub-cap streak length seen: {lengths}")
+        self.assertTrue(lengths & {5, 6, 7}, f"no cap-saturating streak length (>=5) seen: {lengths}")
+
+    def test_budget_exhaustion_continues_with_prior_terminate_in_history(self):
+        """Regression test for the other live-data finding: episodes used to
+        end at (or one step after) their own trigger, so the model never
+        trained on its own TERMINATE recommendation already sitting in
+        recent_actions - exactly what real observe-only deployment produces,
+        since nothing there stops a run. An offline ablation against the
+        deployed checkpoint found this was a hard, instantly-saturating
+        switch (P(TERMINATE) 0.56->0.94 on one prior entry) rather than
+        something the model had ever been trained against."""
+        rng = random.Random(0)
+        saw_prior_terminate = False
+        for _ in range(100):
+            steps = gen.episode_snapshots("budget_exhaustion", rng)
+            for snapshot, action in steps:
+                if ActionSpace.decode(action) == "TERMINATE" and "TERMINATE" in snapshot.recent_actions:
+                    saw_prior_terminate = True
+                    break
+            if saw_prior_terminate:
+                break
+        self.assertTrue(saw_prior_terminate, "no budget_exhaustion step ever had a prior TERMINATE in history")
+
+    def test_non_exhaustion_categories_sometimes_reach_high_usage_without_terminating(self):
+        """The other half of the density-balance fix: non-exhaustion
+        categories used to cap at ~33% budget used across their own real
+        length, so the model saw almost no genuinely-CONTINUE examples in the
+        65-90% zone - only budget_exhaustion's own thin pre-trigger ramp did,
+        and that was too sparse to offset the extra TERMINATE mass the
+        continuation fix above adds there. This must never cross into an
+        actual TERMINATE for a non-exhaustion category (the original
+        2026-09-25 code-review fix's invariant)."""
+        rng = random.Random(0)
+        reached_high_usage = False
+        for category in ("normal", "stuck_loop", "error_recovery", "risky_tool"):
+            for _ in range(100):
+                for snapshot, action in gen.episode_snapshots(category, rng):
+                    used = max(snapshot.step_number / max(snapshot.max_steps, 1),
+                              snapshot.cost_so_far / max(snapshot.cost_budget, 1e-9))
+                    if used >= 0.65:
+                        reached_high_usage = True
+                    self.assertNotEqual(ActionSpace.decode(action), "TERMINATE",
+                                        f"{category} terminated at {used:.2f} used")
+        self.assertTrue(reached_high_usage, "no non-exhaustion episode ever reached 65% budget used")
+
     def test_actions_are_valid_indices(self):
         _, actions = gen.generate_episodes(num_episodes=20)
         self.assertTrue(np.all(actions >= 0))
