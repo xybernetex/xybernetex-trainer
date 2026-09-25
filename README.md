@@ -39,10 +39,10 @@ follows that same recipe, not hierarchy's.
   Cloudflare embedding call. Not a text embedding of the whole trajectory -
   worker-prod's pattern of deterministic, structural features is what
   actually made its policy work, and that's the part worth keeping.
-- **Model** (`chassis/actor_critic.py`, not yet implemented): shared
-  LayerNorm+GELU trunk -> actor head (8-way softmax) + critic head, ~100K
-  parameters at the scale worker-prod runs at - still small enough for the
-  same pure-JS Cloudflare Worker forward pass already proven for hierarchy's
+- **Model** (`chassis/actor_critic.py`): shared LayerNorm+GELU trunk (same
+  layer widths as worker-prod's own) -> actor head (8-way softmax) + critic
+  head, 70,921 parameters - still small enough for the same pure-JS
+  Cloudflare Worker forward pass already proven for hierarchy's
   policy.
 - **Teacher** (`teacher/heuristic_teacher.py`, not yet implemented):
   deterministic rules, not an LLM judge - same choice worker-prod's
@@ -68,14 +68,13 @@ follows that same recipe, not hierarchy's.
 
 ## Status (2026-09-24)
 
-`chassis/action_space.py`, `data/trajectory_schema.py`, and
-`chassis/state_vectorizer.py` are real and tested (`STATE_DIM = 140`: 12
-structural features + 16-step x 8-action one-hot history). Everything else
-is a stub with a docstring describing the planned design - see each file's
-own `NotImplementedError` message for what it's waiting on. Build order:
-`actor_critic.py` (unblocked now that `STATE_DIM` is fixed) ->
-`synthetic_generator.py` + `heuristic_teacher.py` -> `bc_trainer.py` ->
-`export_weights.py`.
+`chassis/` is fully real and tested now: `action_space.py`,
+`state_vectorizer.py` (`STATE_DIM = 140`), and `actor_critic.py` (70,921
+params). `data/trajectory_schema.py` is real too. Everything else is a stub
+with a docstring describing the planned design - see each file's own
+`NotImplementedError` message for what it's waiting on. Build order:
+`synthetic_generator.py` + `heuristic_teacher.py` (unblocked now that the
+chassis exists) -> `bc_trainer.py` -> `export_weights.py`.
 
 ## Setup
 
