@@ -1,10 +1,80 @@
 import unittest
 
+from chassis.action_space import ActionSpace
+from data.trajectory_schema import ToolCallRecord, TrajectorySnapshot
+from teacher import heuristic_teacher as teacher
 
-@unittest.skip("teacher/heuristic_teacher.py not implemented yet - see its docstring for the planned rules")
+
+def _snapshot(**overrides) -> TrajectorySnapshot:
+    defaults = dict(run_id="r1", objective="do the thing", step_number=5, max_steps=20,
+                     cost_so_far=1.0, cost_budget=10.0)
+    defaults.update(overrides)
+    return TrajectorySnapshot(**defaults)
+
+
+def _call(tool_name="web_search", params=None, success=True, timed_out=False):
+    return ToolCallRecord(tool_name=tool_name, params=params or {"q": "x"}, success=success,
+                           timed_out=timed_out)
+
+
+def _select(snapshot) -> str:
+    return ActionSpace.decode(teacher.select_action(snapshot))
+
+
 class TestHeuristicTeacher(unittest.TestCase):
-    def test_placeholder(self):
-        pass
+    def test_destructive_tool_blocks_immediately(self):
+        snap = _snapshot(tool_history=[_call(tool_name="delete_all_files")])
+        self.assertEqual(_select(snap), "BLOCK_ACTION")
+
+    def test_sensitive_tool_requests_user(self):
+        snap = _snapshot(tool_history=[_call(tool_name="send_email")])
+        self.assertEqual(_select(snap), "REQUEST_USER")
+
+    def test_safe_tool_with_no_other_issues_continues(self):
+        snap = _snapshot(tool_history=[_call(tool_name="web_search")])
+        self.assertEqual(_select(snap), "CONTINUE")
+
+    def test_repeated_call_triggers_replan(self):
+        snap = _snapshot(tool_history=[_call(params={"q": "a"})] * (teacher.REPEAT_THRESHOLD + 1))
+        self.assertEqual(_select(snap), "REPLAN")
+
+    def test_repeat_below_threshold_does_not_trigger_replan(self):
+        snap = _snapshot(tool_history=[_call(params={"q": "a"})] * teacher.REPEAT_THRESHOLD)
+        self.assertNotEqual(_select(snap), "REPLAN")
+
+    def test_risk_tier_outranks_repeat_detection(self):
+        # A repeated destructive call should still BLOCK, not REPLAN -
+        # risk tier is checked first regardless of repeat count.
+        snap = _snapshot(tool_history=[_call(tool_name="drop_table")] * 5)
+        self.assertEqual(_select(snap), "BLOCK_ACTION")
+
+    def test_single_failure_injects_context_not_bare_continue(self):
+        snap = _snapshot(tool_history=[_call(success=True), _call(success=False)])
+        self.assertEqual(_select(snap), "INJECT_CONTEXT")
+
+    def test_consecutive_failures_escalate_to_request_user(self):
+        history = [_call(success=False, params={"q": str(i)}) for i in range(teacher.ERROR_ESCALATION_THRESHOLD)]
+        snap = _snapshot(tool_history=history)
+        self.assertEqual(_select(snap), "REQUEST_USER")
+
+    def test_low_step_budget_terminates(self):
+        snap = _snapshot(step_number=19, max_steps=20, tool_history=[_call()])
+        self.assertEqual(_select(snap), "TERMINATE")
+
+    def test_low_cost_budget_terminates(self):
+        snap = _snapshot(cost_so_far=9.5, cost_budget=10.0, tool_history=[_call()])
+        self.assertEqual(_select(snap), "TERMINATE")
+
+    def test_empty_history_does_not_crash(self):
+        snap = _snapshot(tool_history=[])
+        self.assertEqual(_select(snap), "CONTINUE")
+
+    def test_zero_cost_budget_does_not_crash_or_false_trigger_termination(self):
+        snap = _snapshot(cost_so_far=0.0, cost_budget=0.0, step_number=5, max_steps=20,
+                          tool_history=[_call()])
+        # cost_remaining defaults to 1.0 when there's no budget configured -
+        # only the step budget should be able to trigger TERMINATE here.
+        self.assertEqual(_select(snap), "CONTINUE")
 
 
 if __name__ == "__main__":

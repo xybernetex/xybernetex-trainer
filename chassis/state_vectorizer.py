@@ -43,26 +43,52 @@ _MAX_CONSECUTIVE_REPEAT: float = 5.0
 _MAX_CONSECUTIVE_ERRORS: float = 5.0
 
 # Canonical source for "is this tool call risky" - teacher/heuristic_teacher.py
-# imports this rather than redefining its own copy, the same way worker-prod's
+# imports these rather than redefining its own copy, the same way worker-prod's
 # rollout_generator.py imports keyword helpers from its own rl_chassis.py.
-_RISKY_TOOL_KEYWORDS: frozenset[str] = frozenset({
+#
+# Two tiers, not one boolean: DESTRUCTIVE actions are irreversible enough
+# that the teacher should refuse them outright (BLOCK_ACTION); SENSITIVE
+# actions have a real external effect (money moves, an email goes out, a
+# release happens) but aren't inherently wrong the way a stray `rm` is, so
+# the teacher asks a human instead (REQUEST_USER) rather than blocking.
+# is_risky_tool() stays as a single coarse bit for the state vector, which
+# only needs "is this situation elevated" - the tier distinction is a
+# decision the teacher makes, not something the policy's input needs to see
+# split apart.
+_DESTRUCTIVE_TOOL_KEYWORDS: frozenset[str] = frozenset({
     "exec", "shell", "bash", "powershell", "eval", "run_command",
     "delete", "remove", "rm", "drop", "truncate", "purge",
+})
+_SENSITIVE_TOOL_KEYWORDS: frozenset[str] = frozenset({
     "payment", "charge", "transfer", "withdraw",
     "send_email", "post", "publish", "deploy",
 })
 
 
-def is_risky_tool(tool_name: str) -> bool:
+def risk_tier(tool_name: str) -> str | None:
+    """Returns "destructive", "sensitive", or None. Checks destructive
+    first - a name matching both (unlikely, but e.g. "delete_and_publish")
+    should be treated as the more severe tier."""
     name = tool_name.lower()
-    return any(keyword in name for keyword in _RISKY_TOOL_KEYWORDS)
+    if any(keyword in name for keyword in _DESTRUCTIVE_TOOL_KEYWORDS):
+        return "destructive"
+    if any(keyword in name for keyword in _SENSITIVE_TOOL_KEYWORDS):
+        return "sensitive"
+    return None
+
+
+def is_risky_tool(tool_name: str) -> bool:
+    return risk_tier(tool_name) is not None
 
 
 def _same_call(a, b) -> bool:
     return a.tool_name == b.tool_name and a.params == b.params
 
 
-def _consecutive_repeat_count(tool_history: list) -> int:
+def consecutive_repeat_count(tool_history: list) -> int:
+    """How many calls immediately before the last one are identical to it -
+    0 means the last call is not a repeat of anything. Shared with
+    teacher/heuristic_teacher.py's loop-detection rule."""
     if not tool_history:
         return 0
     last = tool_history[-1]
@@ -75,7 +101,9 @@ def _consecutive_repeat_count(tool_history: list) -> int:
     return count - 1  # the last call itself doesn't count as a "repeat"
 
 
-def _consecutive_error_count(tool_history: list) -> int:
+def consecutive_error_count(tool_history: list) -> int:
+    """How many calls, counting back from the most recent, failed in a row.
+    Shared with teacher/heuristic_teacher.py's error-escalation rule."""
     count = 0
     for call in reversed(tool_history):
         if not call.success:
@@ -95,14 +123,14 @@ def _build_structural(snapshot) -> np.ndarray:
     history = snapshot.tool_history
     if len(history) >= 2:
         s[2] = 1.0 if _same_call(history[-1], history[-2]) else 0.0
-    s[3] = min(_consecutive_repeat_count(history) / _MAX_CONSECUTIVE_REPEAT, 1.0)
+    s[3] = min(consecutive_repeat_count(history) / _MAX_CONSECUTIVE_REPEAT, 1.0)
 
     recent = history[-_RECENT_WINDOW:]
     if recent:
         s[4] = sum(1 for c in recent if c.success) / len(recent)
         s[5] = sum(1 for c in recent if c.timed_out) / len(recent)
         s[6] = sum(1 for c in recent if not c.success and not c.timed_out) / len(recent)
-    s[7] = min(_consecutive_error_count(history) / _MAX_CONSECUTIVE_ERRORS, 1.0)
+    s[7] = min(consecutive_error_count(history) / _MAX_CONSECUTIVE_ERRORS, 1.0)
 
     s[8] = 1.0 if (history and is_risky_tool(history[-1].tool_name)) else 0.0
 
