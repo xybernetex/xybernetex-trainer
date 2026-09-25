@@ -18,7 +18,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from data.trajectory_schema import ToolCallRecord, TrajectorySnapshot
+from data.trajectory_schema import ToolCallRecord, TrajectorySnapshot, ProposedToolCall
 
 DEFAULT_LOG_PATH = Path.home() / ".openclaw" / "xybernetex-supervisor.jsonl"
 
@@ -64,6 +64,8 @@ def _snapshot_from_json(raw: dict) -> TrajectorySnapshot:
         cost_so_far=raw.get("cost_so_far", 0.0),
         cost_budget=raw.get("cost_budget", 0.0),
         goal_drift_score=raw.get("goal_drift_score"),
+        feature_schema=raw.get("feature_schema", "xybernetex.state.v1"),
+        proposed_call=ProposedToolCall(**raw["proposed_call"]) if raw.get("proposed_call") is not None else None,
     )
 
 
@@ -77,7 +79,7 @@ def load_runs(log_path: str | Path = DEFAULT_LOG_PATH, since: str | None = None)
                 entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if "debug" in entry or "runKey" not in entry:
+            if not isinstance(entry, dict) or "debug" in entry or "runKey" not in entry or entry.get("type") == "tool_proposal":
                 continue
             if since and entry.get("ts", "") < since:
                 continue
@@ -107,3 +109,20 @@ def load_runs(log_path: str | Path = DEFAULT_LOG_PATH, since: str | None = None)
 def load_sessions(log_dir: str):
     """The original placeholder interface: every run in the log under log_dir."""
     return list(load_runs(Path(log_dir) / DEFAULT_LOG_PATH.name).values())
+
+
+def load_proposals(log_path: str | Path = DEFAULT_LOG_PATH) -> list[TrajectorySnapshot]:
+    """Load pending-call telemetry without treating proposals as executed steps."""
+    snapshots = []
+    with open(log_path, encoding="utf-8") as stream:
+        for line in stream:
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(entry, dict) and entry.get("type") == "tool_proposal":
+                snapshot = _snapshot_from_json(entry["snapshot"])
+                if snapshot.feature_schema != "xybernetex.state.v2" or snapshot.proposed_call is None:
+                    raise ValueError("tool_proposal requires a v2 snapshot with proposed_call")
+                snapshots.append(snapshot)
+    return snapshots

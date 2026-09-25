@@ -39,6 +39,7 @@ ACTION_COUNT: int = ActionSpace.N
 HISTORY_LEN: int = 16
 _STRUCT_DIM: int = 12
 STATE_DIM: int = _STRUCT_DIM + HISTORY_LEN * ACTION_COUNT
+FEATURE_SCHEMA = "xybernetex.state.v1"
 
 _RECENT_WINDOW: int = 8
 _MAX_CONSECUTIVE_REPEAT: float = 5.0
@@ -192,6 +193,10 @@ def _build_action_history(snapshot) -> np.ndarray:
 
 
 def vectorize(snapshot) -> np.ndarray:
+    if getattr(snapshot, "feature_schema", FEATURE_SCHEMA) != FEATURE_SCHEMA:
+        raise ValueError("v1 vectorizer requires xybernetex.state.v1")
+    if getattr(snapshot, "proposed_call", None) is not None:
+        raise ValueError("pending proposals require the v2 vectorizer")
     structural = _build_structural(snapshot)
     history = _build_action_history(snapshot)
     vec = np.concatenate([structural, history]).astype(np.float32)

@@ -128,6 +128,22 @@ cp .env.example .env            # only needed once the goal-drift feature is imp
 
 ## Test
 
+### Pending-call review (v2, not training data yet)
+
+Run the plugin's `python scripts/control_smoke.py --proposals` against the
+configured disposable OpenClaw sandbox, then audit its two captured logs:
+
+```bash
+python -m scenarios.proposal_report ../xybernetex-openclaw/out/<batch>/observe-telemetry.jsonl ../xybernetex-openclaw/out/<batch>/enforce-telemetry.jsonl --output out/proposal-review.json
+```
+
+This validates v2 vectors and joins proposals, local rule decisions and local
+completion callbacks by run and host call ID. Missing outcomes remain unknown;
+ambiguous, reordered or modified calls are flagged. A completion callback is
+not independent proof of filesystem effects or task success. All exported
+targets remain null until reviewed: explicit test restrictions are not universal
+teacher labels. Split future datasets by whole run before training.
+
 ```bash
 python -m unittest discover -s tests
 ```

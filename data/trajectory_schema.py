@@ -31,6 +31,15 @@ class ToolCallRecord:
 
 
 @dataclass
+class ProposedToolCall:
+    """A pending operation has no success, timeout or other execution outcome."""
+    tool_name: str
+    params: dict
+    risk: str | None = None
+    tool_call_id: str | None = None
+
+
+@dataclass
 class TrajectorySnapshot:
     run_id: str
     objective: str
@@ -50,3 +59,5 @@ class TrajectorySnapshot:
     # this feature existed), not "zero drift" - the vectorizer must treat
     # those differently.
     goal_drift_score: float | None = None
+    feature_schema: str = "xybernetex.state.v1"
+    proposed_call: ProposedToolCall | None = None
