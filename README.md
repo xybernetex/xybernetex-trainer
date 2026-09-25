@@ -79,24 +79,32 @@ follows that same recipe, not hierarchy's.
   the module's own docstring. `replay_loader.py` is a placeholder for
   parsing real logged OpenClaw sessions once Pass 1 (observe-only) logging
   exists - blocked for now.
-- **Export** (`export/export_weights.py`, not yet implemented): packs a
-  trained checkpoint into `manifest.json` + `weights.bin` for
-  `xybernetex-cfworker`. The *only* place in either repo that needs to know
-  the model's architecture - `xybernetex-cfworker`'s upload script is a
-  dumb file-mover, not a hand-duplicated copy of this model's class
-  (the old, more fragile pattern hierarchy's cfworker repo used).
+- **Export** (`export/export_weights.py`): packs a trained checkpoint into
+  `manifest.json` + `weights.bin` for `xybernetex-cfworker`, reading the
+  tensor list directly off `model.state_dict()` rather than hardcoding
+  names - the *only* place in either repo that needs to know the model's
+  architecture. Includes a pure-NumPy `reference_forward()` (no PyTorch)
+  that reconstructs the model's output from ONLY the packed bytes, proving
+  the format actually carries everything needed - matched the real
+  PyTorch model to ~4.6e-7 max abs diff over 200 random inputs. GELU has no
+  native NumPy or JavaScript implementation, so both this reference and
+  `xybernetex-cfworker`'s eventual `src/policy.js` use the same
+  Abramowitz & Stegun erf approximation rather than the cruder tanh-GELU
+  shortcut, to keep that same tight numerical parity on the JS side too.
 
 ## Status (2026-09-24)
 
-Everything except `export/export_weights.py` is real and tested (53 tests).
-`train/bc_trainer.py`'s trained policy correctly classifies >80% of every
-reachable action on a fresh, never-trained-on evaluation set (>90% for
-`CONTINUE`). Two known, documented limitations, not silently papered over:
-`MODIFY_ACTION`/`NARROW_TOOLS` are unreachable by the current teacher (see
-Teacher above), and the synthetic dataset confounds each category's trigger
-with a fixed step position (see Data above). Only `export_weights.py`
-remains - the last step before a checkpoint can actually reach
-`xybernetex-cfworker`.
+Every module is real and tested now (59 tests) - `chassis/`, `data/`,
+`teacher/`, `train/`, and `export/`. `train/bc_trainer.py`'s trained policy
+correctly classifies >80% of every reachable action on a fresh,
+never-trained-on evaluation set (>90% for `CONTINUE`). Two known, documented
+limitations, not silently papered over: `MODIFY_ACTION`/`NARROW_TOOLS` are
+unreachable by the current teacher (see Teacher above), and the synthetic
+dataset confounds each category's trigger with a fixed step position (see
+Data above). Remaining work is on the `xybernetex-cfworker` side: its
+`src/policy.js`/`src/index.js` stubs need to implement the same forward pass
+`export/export_weights.py.reference_forward()` already specifies and tests
+against.
 
 ## Setup
 
