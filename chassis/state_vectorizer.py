@@ -101,6 +101,25 @@ def risk_tier(tool_name: str) -> str | None:
     return None
 
 
+RISK_LABELS: tuple[str, ...] = ("destructive", "sensitive", "none")
+
+
+def effective_risk_tier(call) -> str | None:
+    """The call's risk tier: its own `risk` label when the recorder assessed
+    one (ToolCallRecord.risk - e.g. the OpenClaw plugin reading a shell
+    command's text), otherwise risk_tier() on the tool name. A name alone
+    can't separate `rm -rf` from `python test.py` when both go through one
+    shell tool - real OpenClaw logs had every `exec` call judged destructive -
+    so a recorded label always wins, including an explicit "none".
+    Shared with teacher/heuristic_teacher.py."""
+    risk = getattr(call, "risk", None)
+    if risk is None:
+        return risk_tier(call.tool_name)
+    if risk not in RISK_LABELS:
+        raise ValueError(f"Unknown risk label {risk!r}; expected one of {RISK_LABELS}")
+    return None if risk == "none" else risk
+
+
 def _same_call(a, b) -> bool:
     return a.tool_name == b.tool_name and a.params == b.params
 
@@ -141,7 +160,7 @@ def _build_structural(snapshot) -> np.ndarray:
     s[1] = (snapshot.max_steps - snapshot.step_number) / horizon
 
     history = snapshot.tool_history
-    tier = risk_tier(history[-1].tool_name) if history else None
+    tier = effective_risk_tier(history[-1]) if history else None
     s[2] = 1.0 if tier == "sensitive" else 0.0
     s[3] = min(consecutive_repeat_count(history) / _MAX_CONSECUTIVE_REPEAT, 1.0)
 

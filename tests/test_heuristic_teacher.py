@@ -30,6 +30,12 @@ class TestHeuristicTeacher(unittest.TestCase):
         snap = _snapshot(tool_history=[_call(tool_name="send_email")])
         self.assertEqual(_select(snap), "REQUEST_USER")
 
+    def test_recorded_risk_label_decides_over_the_tool_name(self):
+        shell = lambda risk: ToolCallRecord(tool_name="exec", params={"c": 1}, success=True, risk=risk)
+        self.assertEqual(_select(_snapshot(tool_history=[shell("none")])), "CONTINUE")
+        self.assertEqual(_select(_snapshot(tool_history=[shell("destructive")])), "BLOCK_ACTION")
+        self.assertEqual(_select(_snapshot(tool_history=[shell("sensitive")])), "REQUEST_USER")
+
     def test_safe_tool_with_no_other_issues_continues(self):
         snap = _snapshot(tool_history=[_call(tool_name="web_search")])
         self.assertEqual(_select(snap), "CONTINUE")

@@ -21,6 +21,13 @@ class ToolCallRecord:
     success: bool
     error: str | None = None
     timed_out: bool = False
+    # Risk tier assessed by whoever recorded the call, from what it actually
+    # did - "destructive", "sensitive", or "none" - e.g. the OpenClaw plugin
+    # classifies a shell tool's command text on the user's machine, where the
+    # text itself never leaves. None means "not assessed": the vectorizer then
+    # falls back to judging the tool NAME (state_vectorizer.effective_risk_tier),
+    # which is all synthetic data carries.
+    risk: str | None = None
 
 
 @dataclass

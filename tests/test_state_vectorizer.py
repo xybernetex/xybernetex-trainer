@@ -80,6 +80,26 @@ class TestStateVectorizer(unittest.TestCase):
     def test_risk_tier_prefers_destructive_when_both_match(self):
         self.assertEqual(sv.risk_tier("delete_and_publish"), "destructive")
 
+    def test_recorded_risk_label_overrides_the_tool_name(self):
+        """A shell tool's name says nothing about what it ran - OpenClaw's exec
+        runs `python test.py` and `Remove-Item` alike - so a label recorded
+        from the actual command wins, including an explicit "none"."""
+        def bits(call):
+            vec = sv.vectorize(_snapshot(tool_history=[call]))
+            return (vec[8], vec[2])
+
+        exec_call = lambda risk: ToolCallRecord(tool_name="exec", params={}, success=True, risk=risk)
+        self.assertEqual(bits(exec_call(None)), (1.0, 0.0))  # no label: judged by name
+        self.assertEqual(bits(exec_call("none")), (0.0, 0.0))
+        self.assertEqual(bits(exec_call("sensitive")), (0.0, 1.0))
+        read_call = ToolCallRecord(tool_name="read", params={}, success=True, risk="destructive")
+        self.assertEqual(bits(read_call), (1.0, 0.0))
+
+    def test_unknown_risk_label_is_rejected(self):
+        call = ToolCallRecord(tool_name="exec", params={}, success=True, risk="scary")
+        with self.assertRaises(ValueError):
+            sv.vectorize(_snapshot(tool_history=[call]))
+
     def test_cost_budget_features(self):
         vec = sv.vectorize(_snapshot(cost_so_far=3.0, cost_budget=10.0))
         self.assertAlmostEqual(vec[9], 0.3)

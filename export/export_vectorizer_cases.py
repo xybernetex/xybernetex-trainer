@@ -41,9 +41,9 @@ def _snap(**overrides) -> TrajectorySnapshot:
     return TrajectorySnapshot(**fields)
 
 
-def _call(tool_name="read_file", params=None, success=True, timed_out=False) -> ToolCallRecord:
+def _call(tool_name="read_file", params=None, success=True, timed_out=False, risk=None) -> ToolCallRecord:
     return ToolCallRecord(tool_name=tool_name, params={"arg": 1} if params is None else params,
-                          success=success, timed_out=timed_out)
+                          success=success, timed_out=timed_out, risk=risk)
 
 
 def edge_cases() -> list[tuple[str, TrajectorySnapshot]]:
@@ -69,6 +69,12 @@ def edge_cases() -> list[tuple[str, TrajectorySnapshot]]:
         ("postgres is not post", _snap(tool_history=[_call("postgres_query")])),
         ("send without email", _snap(tool_history=[_call("send_message")])),
         ("non-ascii name", _snap(tool_history=[_call("ÜberDelete")])),
+        ("recorded risk none overrides a risky name", _snap(tool_history=[_call("exec", risk="none")])),
+        ("recorded destructive on a benign name", _snap(tool_history=[_call("read", risk="destructive")])),
+        ("recorded sensitive on a shell tool", _snap(tool_history=[_call("exec", risk="sensitive")])),
+        ("unlabelled shell tool falls back to its name", _snap(tool_history=[_call("exec")])),
+        ("only the last call's label counts",
+         _snap(tool_history=[_call("exec", risk="destructive"), _call("exec", risk="none")])),
         ("only the last call's tier counts",
          _snap(tool_history=[_call("delete_file"), _call("read_file")])),
         ("repeat with reordered params",

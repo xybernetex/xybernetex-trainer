@@ -9,7 +9,8 @@ snapshot always produces the same label.
 
 Rules, in priority order (first match wins):
   1. the most recent tool call's risk tier (chassis/state_vectorizer.py's
-     risk_tier()) is "destructive" -> BLOCK_ACTION (refuse outright);
+     effective_risk_tier(): its recorded risk label, else judged from the
+     tool name) is "destructive" -> BLOCK_ACTION (refuse outright);
      "sensitive" -> REQUEST_USER (needs a human sign-off, not inherently
      wrong the way a stray delete is)
   2. the same tool+params has now repeated REPEAT_THRESHOLD+1 times in a
@@ -41,7 +42,7 @@ treating this teacher as feature-complete.
 from __future__ import annotations
 
 from chassis.action_space import ActionSpace
-from chassis.state_vectorizer import consecutive_error_count, consecutive_repeat_count, risk_tier
+from chassis.state_vectorizer import consecutive_error_count, consecutive_repeat_count, effective_risk_tier
 
 REPEAT_THRESHOLD: int = 2
 ERROR_ESCALATION_THRESHOLD: int = 2
@@ -52,7 +53,7 @@ def select_action(snapshot) -> int:
     history = snapshot.tool_history
 
     if history:
-        tier = risk_tier(history[-1].tool_name)
+        tier = effective_risk_tier(history[-1])
         if tier == "destructive":
             return ActionSpace.encode("BLOCK_ACTION")
         if tier == "sensitive":
