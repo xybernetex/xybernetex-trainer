@@ -89,6 +89,15 @@ follows that same recipe, not hierarchy's.
   `xybernetex-cfworker`'s eventual `src/policy.js` use the same
   Abramowitz & Stegun erf approximation rather than the cruder tanh-GELU
   shortcut, to keep that same tight numerical parity on the JS side too.
+- **Vectorizer parity** (`export/export_vectorizer_cases.py`): the Worker
+  builds features itself from a raw snapshot, using a JS port of
+  `chassis/state_vectorizer.py`. This script runs the real Python
+  vectorizer over edge cases and seeded synthetic episodes and writes the
+  (snapshot, features) pairs `xybernetex-cfworker`'s tests must reproduce
+  bit-for-bit. **Any change to the vectorizer needs this rerun and the
+  output committed to cfworker**, or training and serving silently
+  disagree:
+  `python -m export.export_vectorizer_cases --output ../xybernetex-cfworker/test/fixtures/vectorizer_cases.json`
 
 ## Status (2026-09-25)
 

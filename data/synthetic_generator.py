@@ -97,14 +97,15 @@ def _episode_budgets(category: str, rng: random.Random, length: int) -> tuple[in
     return generous_steps, cost_per_step, cost_per_step * length * rng.uniform(0.85, 1.0)  # cost runs out
 
 
-def generate_episode(category: str, rng: random.Random) -> tuple[list[np.ndarray], list[int]]:
-    """One episode of the given category -> (per-step state vectors, per-step teacher action indices)."""
+def episode_snapshots(category: str, rng: random.Random) -> list[tuple[TrajectorySnapshot, int]]:
+    """One episode of the given category -> per-step (snapshot, teacher action index).
+    Kept separate from generate_episode so export/export_vectorizer_cases.py
+    can ship the raw snapshots to xybernetex-cfworker's parity test."""
     length = rng.randint(_MIN_EPISODE_LENGTH, _MAX_EPISODE_LENGTH)
     max_steps, cost_per_step, cost_budget = _episode_budgets(category, rng, length)
     history = _build_episode_history(category, rng, length)
 
-    states: list[np.ndarray] = []
-    actions: list[int] = []
+    steps: list[tuple[TrajectorySnapshot, int]] = []
     recent_action_names: list[str] = []
     for step in range(1, length + 1):
         snapshot = TrajectorySnapshot(
@@ -118,10 +119,15 @@ def generate_episode(category: str, rng: random.Random) -> tuple[list[np.ndarray
             cost_budget=cost_budget,
         )
         action_index = select_action(snapshot)
-        states.append(vectorize(snapshot))
-        actions.append(action_index)
+        steps.append((snapshot, action_index))
         recent_action_names.append(ActionSpace.decode(action_index))
-    return states, actions
+    return steps
+
+
+def generate_episode(category: str, rng: random.Random) -> tuple[list[np.ndarray], list[int]]:
+    """One episode of the given category -> (per-step state vectors, per-step teacher action indices)."""
+    steps = episode_snapshots(category, rng)
+    return [vectorize(snapshot) for snapshot, _ in steps], [action for _, action in steps]
 
 
 def generate_episodes(num_episodes: int = 1500, seed: int = 42) -> tuple[np.ndarray, np.ndarray]:
