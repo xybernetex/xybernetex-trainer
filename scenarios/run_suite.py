@@ -36,23 +36,28 @@ AGENT_ID = "scenarios"
 WORKSPACE = Path.home() / ".openclaw" / "workspace-scenarios"
 BATCH_DIR = Path(__file__).parent / "batches"
 
-# Workers AI models verified (2026-09-25) to make streamed follow-up tool
-# calls - see the openclaw-workers-ai-models note. short name -> (model id, context window)
+# Workers AI models verified (2026-09-25) to run real multi-turn OpenClaw
+# sessions end to end (not just a raw single-tool-call API probe - gpt-oss-120b
+# passed that probe but fails inside OpenClaw's actual, larger request shape;
+# see the openclaw-workers-ai-models note). short name -> (model id, context window)
 MODELS: dict[str, tuple[str, int]] = {
     "glm53f": ("@cf/zai-org/glm-5.3-flash", 1_310_720),
     "glm53": ("@cf/zai-org/glm-5.3", 262_144),
     "glm47f": ("@cf/zai-org/glm-4.7-flash", 131_072),
     "dsv4f": ("@cf/deepseek-ai/deepseek-v4-flash-0731", 1_310_720),
     "dsv4p": ("@cf/deepseek-ai/deepseek-v4-pro-0813", 1_048_576),
-    "gptoss": ("@cf/openai/gpt-oss-120b", 128_000),
     "qwen38": ("@cf/qwen/qwen3.8-27b", 262_144),
     "nemo3": ("@cf/nvidia/nemotron-3-120b-a12b", 256_000),
     "gemma4": ("@cf/google/gemma-4-26b-a4b-it", 256_000),
     "kimi27c": ("@cf/moonshotai/kimi-k2.7-code", 262_144),
 }
 # Registered for manual use but excluded from the suite: they fail inside
-# OpenClaw (Scout writes tool calls as text; Kimi K2.6 loses streamed ones).
-_LEGACY_MODELS = {"@cf/meta/llama-4-scout-17b-16e-instruct": 131_000, "@cf/moonshotai/kimi-k2.6": 262_144}
+# OpenClaw (Scout writes tool calls as text; Kimi K2.6 loses streamed follow-up
+# tool calls; gpt-oss-120b's Workers AI endpoint 400s on OpenClaw's real
+# multi-tool request shape after the first tool result - confirmed twice, see
+# scenarios/batches/model-screen).
+_LEGACY_MODELS = {"@cf/meta/llama-4-scout-17b-16e-instruct": 131_000, "@cf/moonshotai/kimi-k2.6": 262_144,
+                  "@cf/openai/gpt-oss-120b": 128_000}
 
 PROVIDER = "workers-ai"
 
