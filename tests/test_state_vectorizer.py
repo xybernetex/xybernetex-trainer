@@ -1,10 +1,101 @@
 import unittest
 
+import numpy as np
 
-@unittest.skip("chassis/state_vectorizer.py not implemented yet - see its docstring for the planned design")
+from chassis import state_vectorizer as sv
+from chassis.action_space import ActionSpace
+from data.trajectory_schema import ToolCallRecord, TrajectorySnapshot
+
+
+def _snapshot(**overrides) -> TrajectorySnapshot:
+    defaults = dict(run_id="r1", objective="do the thing", step_number=5, max_steps=20)
+    defaults.update(overrides)
+    return TrajectorySnapshot(**defaults)
+
+
+def _call(tool_name="web_search", params=None, success=True, error=None, timed_out=False):
+    return ToolCallRecord(tool_name=tool_name, params=params or {"q": "x"}, success=success,
+                           error=error, timed_out=timed_out)
+
+
 class TestStateVectorizer(unittest.TestCase):
-    def test_placeholder(self):
-        pass
+    def test_output_shape_and_dtype(self):
+        vec = sv.vectorize(_snapshot())
+        self.assertEqual(vec.shape, (sv.STATE_DIM,))
+        self.assertEqual(vec.dtype, np.float32)
+
+    def test_step_budget_features(self):
+        vec = sv.vectorize(_snapshot(step_number=5, max_steps=20))
+        self.assertAlmostEqual(vec[0], 5 / 20)
+        self.assertAlmostEqual(vec[1], 15 / 20)
+
+    def test_repeat_detection(self):
+        same_twice = _snapshot(tool_history=[_call(params={"q": "a"}), _call(params={"q": "a"})])
+        different = _snapshot(tool_history=[_call(params={"q": "a"}), _call(params={"q": "b"})])
+        self.assertEqual(sv.vectorize(same_twice)[2], 1.0)
+        self.assertEqual(sv.vectorize(different)[2], 0.0)
+
+    def test_consecutive_repeat_count_scales_with_streak(self):
+        one_repeat = _snapshot(tool_history=[_call(params={"q": "a"}), _call(params={"q": "a"})])
+        three_repeats = _snapshot(tool_history=[_call(params={"q": "a"})] * 4)
+        self.assertLess(sv.vectorize(one_repeat)[3], sv.vectorize(three_repeats)[3])
+        self.assertGreater(sv.vectorize(three_repeats)[3], 0.0)
+
+    def test_recent_call_outcome_rates(self):
+        history = [_call(success=True), _call(success=False, timed_out=True), _call(success=False)]
+        vec = sv.vectorize(_snapshot(tool_history=history))
+        self.assertAlmostEqual(vec[4], 1 / 3)  # success_rate
+        self.assertAlmostEqual(vec[5], 1 / 3)  # timeout_rate
+        self.assertAlmostEqual(vec[6], 1 / 3)  # error_rate (failed, not timed out)
+
+    def test_consecutive_error_count(self):
+        history = [_call(success=True), _call(success=False), _call(success=False)]
+        vec = sv.vectorize(_snapshot(tool_history=history))
+        self.assertAlmostEqual(vec[7], 2 / sv._MAX_CONSECUTIVE_ERRORS)
+
+    def test_risky_tool_flag(self):
+        risky = _snapshot(tool_history=[_call(tool_name="shell_exec")])
+        safe = _snapshot(tool_history=[_call(tool_name="web_search")])
+        self.assertEqual(sv.vectorize(risky)[8], 1.0)
+        self.assertEqual(sv.vectorize(safe)[8], 0.0)
+
+    def test_cost_budget_features(self):
+        vec = sv.vectorize(_snapshot(cost_so_far=3.0, cost_budget=10.0))
+        self.assertAlmostEqual(vec[9], 0.3)
+        self.assertAlmostEqual(vec[10], 0.7)
+
+    def test_cost_budget_zero_does_not_crash(self):
+        vec = sv.vectorize(_snapshot(cost_so_far=0.0, cost_budget=0.0))
+        self.assertEqual(vec[9], 0.0)
+        self.assertEqual(vec[10], 0.0)
+
+    def test_goal_drift_defaults_to_zero_when_not_computed(self):
+        vec = sv.vectorize(_snapshot(goal_drift_score=None))
+        self.assertEqual(vec[11], 0.0)
+
+    def test_goal_drift_passthrough_when_computed(self):
+        vec = sv.vectorize(_snapshot(goal_drift_score=0.42))
+        self.assertAlmostEqual(vec[11], 0.42)
+
+    def test_action_history_right_aligned_and_padded(self):
+        vec = sv.vectorize(_snapshot(recent_actions=["CONTINUE"]))
+        history_block = vec[sv._STRUCT_DIM:].reshape(sv.HISTORY_LEN, sv.ACTION_COUNT)
+        # only the last row should be non-zero, at CONTINUE's index
+        self.assertTrue(np.all(history_block[:-1] == 0))
+        expected_row = np.zeros(sv.ACTION_COUNT, dtype=np.float32)
+        expected_row[ActionSpace.encode("CONTINUE")] = 1.0
+        np.testing.assert_array_equal(history_block[-1], expected_row)
+
+    def test_action_history_truncates_to_history_len(self):
+        actions = ["CONTINUE"] * (sv.HISTORY_LEN + 5)
+        vec = sv.vectorize(_snapshot(recent_actions=actions))
+        history_block = vec[sv._STRUCT_DIM:].reshape(sv.HISTORY_LEN, sv.ACTION_COUNT)
+        self.assertTrue(np.all(history_block.sum(axis=1) == 1.0))
+
+    def test_no_nans_or_infs_on_empty_snapshot(self):
+        vec = sv.vectorize(_snapshot())
+        self.assertFalse(np.any(np.isnan(vec)))
+        self.assertFalse(np.any(np.isinf(vec)))
 
 
 if __name__ == "__main__":

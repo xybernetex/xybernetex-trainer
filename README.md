@@ -68,12 +68,14 @@ follows that same recipe, not hierarchy's.
 
 ## Status (2026-09-24)
 
-Shell only. `chassis/action_space.py` and `data/trajectory_schema.py` are
-real and tested; everything else is a stub with a docstring describing the
-planned design - see each file's own `NotImplementedError` message for what
-it's waiting on. Build order: `state_vectorizer.py` (fixes `STATE_DIM`) ->
-`actor_critic.py` -> `synthetic_generator.py` + `heuristic_teacher.py` ->
-`bc_trainer.py` -> `export_weights.py`.
+`chassis/action_space.py`, `data/trajectory_schema.py`, and
+`chassis/state_vectorizer.py` are real and tested (`STATE_DIM = 140`: 12
+structural features + 16-step x 8-action one-hot history). Everything else
+is a stub with a docstring describing the planned design - see each file's
+own `NotImplementedError` message for what it's waiting on. Build order:
+`actor_critic.py` (unblocked now that `STATE_DIM` is fixed) ->
+`synthetic_generator.py` + `heuristic_teacher.py` -> `bc_trainer.py` ->
+`export_weights.py`.
 
 ## Setup
 

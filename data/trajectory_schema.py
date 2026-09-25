@@ -33,3 +33,13 @@ class TrajectorySnapshot:
     tool_history: list[ToolCallRecord] = field(default_factory=list)
     cost_so_far: float = 0.0
     cost_budget: float = 0.0
+    # Cosine distance between an embedding of recent tool-call context and
+    # the stated objective - precomputed by whoever builds this snapshot
+    # (the live serving path, synthetic_generator, or replay_loader), never
+    # by state_vectorizer.py itself. That keeps the vectorizer's "zero
+    # network calls" purity guarantee intact - an embedding call is exactly
+    # the kind of I/O chassis/__init__.py's docstring rules out. None means
+    # "not computed for this snapshot" (e.g. early synthetic data before
+    # this feature existed), not "zero drift" - the vectorizer must treat
+    # those differently.
+    goal_drift_score: float | None = None
