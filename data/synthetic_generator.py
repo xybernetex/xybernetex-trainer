@@ -14,33 +14,27 @@ CONTINUE-dominated distribution, since a classifier trained on a heavily
 imbalanced corpus could get away with never learning the rare-but-important
 interventions:
   - "normal": varied, unrelated, successful tool calls - mostly CONTINUE
-  - "stuck_loop": the same tool+params repeated for the last 4 steps -
-    exercises REPLAN
-  - "error_recovery": the last 3 steps fail (different params each, so this
-    doesn't also trigger repeat-detection) - exercises CONTINUE-then-
-    REQUEST_USER as failures accumulate
-  - "risky_tool": the final step is a destructive or sensitive tool call -
-    exercises BLOCK_ACTION / REQUEST_USER
-  - "budget_exhaustion": max_steps set equal to the episode length (instead
-    of generously larger) so the step budget genuinely runs low near the
-    end - exercises TERMINATE
+  - "stuck_loop": the same tool+params repeated 4 times in a row somewhere
+    in the episode - exercises REPLAN
+  - "error_recovery": 3 consecutive failures somewhere in the episode
+    (different params each, so this doesn't also trigger repeat-detection) -
+    exercises INJECT_CONTEXT-then-REQUEST_USER as failures accumulate
+  - "risky_tool": one destructive or sensitive call somewhere in the episode
+    - exercises BLOCK_ACTION / REQUEST_USER
+  - "budget_exhaustion": either the step budget or the cost budget (chosen
+    per episode) is sized to run out right at the end - exercises TERMINATE
 
-Known confound, found while debugging train/bc_trainer.py's tests (2026-09-24):
-every category's distinguishing feature always occurs at a FIXED step
-position (the risky call is always the 20th and last call; the stuck loop
-is always the final 4 steps; etc.), which means it's also always paired
-with the same step-budget/action-history state that position implies (e.g.
-a risky-tool example is always at full cost-budget consumption with a
-fully-populated 16-step action history). A model trained on this can learn
-the real signal (risk_tier, repeat count, ...) just fine - confirmed
-directly by checking predictions against the model's OWN real training
-examples, not just aggregate accuracy - but it also means this dataset
-can't distinguish "the model learned the causal feature" from "the model
-learned the position/budget confound" the way a hand-crafted, isolated test
-snapshot would expect. Worth varying trigger position within each category
-before trusting this dataset for anything beyond what
-tests/test_bc_trainer.py currently checks (per-class accuracy against a
-fresh sample of the SAME generator, which doesn't probe the confound).
+Every episode draws its own length, trigger position, cost-per-step, and
+budget sizes. An earlier version fixed all of these (20 steps, trigger always
+at the end, cost always hitting the budget exactly at step 20), which caused
+two real problems found in code review (2026-09-25): every category - not
+just budget_exhaustion - ended with 3 TERMINATE labels, since the cost budget
+always ran out, so the model learned "late in the episode => TERMINATE"; and
+every category's trigger was always paired with the same position/budget/
+history state, so the dataset couldn't distinguish "learned the causal
+feature" from "learned the position." Non-budget categories now keep at least
+half their cost budget and two thirds of their step budget, so only
+budget_exhaustion episodes ever reach TERMINATE.
 """
 from __future__ import annotations
 
@@ -59,7 +53,10 @@ _SAFE_TOOLS: tuple[str, ...] = (
 _DESTRUCTIVE_TOOLS: tuple[str, ...] = ("delete_file", "drop_table", "shell_exec", "purge_cache")
 _SENSITIVE_TOOLS: tuple[str, ...] = ("send_email", "publish_post", "transfer_funds", "deploy_release")
 
-_EPISODE_LENGTH: int = 20
+_MIN_EPISODE_LENGTH: int = 12
+_MAX_EPISODE_LENGTH: int = 30
+_STUCK_RUN: int = 4
+_ERROR_RUN: int = 3
 _CATEGORIES: tuple[str, ...] = ("normal", "stuck_loop", "error_recovery", "risky_tool", "budget_exhaustion")
 
 
@@ -69,21 +66,62 @@ def _random_call(rng: random.Random, *, success: bool = True, risky_pool: tuple[
     return ToolCallRecord(tool_name=tool_name, params=params, success=success)
 
 
-def _build_episode_history(category: str, rng: random.Random) -> list[ToolCallRecord]:
-    history: list[ToolCallRecord] = []
-    stuck_call = None
-    for i in range(_EPISODE_LENGTH):
-        if category == "stuck_loop" and i >= _EPISODE_LENGTH - 4:
-            if stuck_call is None:
-                stuck_call = _random_call(rng)
-            history.append(ToolCallRecord(tool_name=stuck_call.tool_name, params=stuck_call.params, success=True))
-        elif category == "error_recovery" and i >= _EPISODE_LENGTH - 3:
-            history.append(_random_call(rng, success=False))
-        elif category == "risky_tool" and i == _EPISODE_LENGTH - 1:
-            history.append(_random_call(rng, risky_pool=_DESTRUCTIVE_TOOLS + _SENSITIVE_TOOLS))
-        else:
-            history.append(_random_call(rng))
+def _build_episode_history(category: str, rng: random.Random, length: int) -> list[ToolCallRecord]:
+    history = [_random_call(rng) for _ in range(length)]
+    if category == "stuck_loop":
+        start = rng.randint(0, length - _STUCK_RUN)
+        stuck = _random_call(rng)
+        for i in range(start, start + _STUCK_RUN):
+            history[i] = ToolCallRecord(tool_name=stuck.tool_name, params=stuck.params, success=True)
+    elif category == "error_recovery":
+        start = rng.randint(0, length - _ERROR_RUN)
+        for i in range(start, start + _ERROR_RUN):
+            history[i] = _random_call(rng, success=False)
+    elif category == "risky_tool":
+        history[rng.randrange(length)] = _random_call(rng, risky_pool=_DESTRUCTIVE_TOOLS + _SENSITIVE_TOOLS)
     return history
+
+
+def _episode_budgets(category: str, rng: random.Random, length: int) -> tuple[int, float, float]:
+    """Returns (max_steps, cost_per_step, cost_budget). Only budget_exhaustion
+    episodes are sized to run out; everything else ends with at least 2/3 of
+    its step budget and 1/2 of its cost budget left, comfortably clear of the
+    teacher's TERMINATE threshold."""
+    cost_per_step = rng.uniform(0.1, 1.0)
+    generous_cost = cost_per_step * length * rng.uniform(2.0, 5.0)
+    generous_steps = length * rng.randint(3, 6)
+    if category != "budget_exhaustion":
+        return generous_steps, cost_per_step, generous_cost
+    if rng.random() < 0.5:
+        return length, cost_per_step, generous_cost                       # step budget runs out
+    return generous_steps, cost_per_step, cost_per_step * length * rng.uniform(0.85, 1.0)  # cost runs out
+
+
+def generate_episode(category: str, rng: random.Random) -> tuple[list[np.ndarray], list[int]]:
+    """One episode of the given category -> (per-step state vectors, per-step teacher action indices)."""
+    length = rng.randint(_MIN_EPISODE_LENGTH, _MAX_EPISODE_LENGTH)
+    max_steps, cost_per_step, cost_budget = _episode_budgets(category, rng, length)
+    history = _build_episode_history(category, rng, length)
+
+    states: list[np.ndarray] = []
+    actions: list[int] = []
+    recent_action_names: list[str] = []
+    for step in range(1, length + 1):
+        snapshot = TrajectorySnapshot(
+            run_id=f"synthetic-{category}",
+            objective="synthetic training objective",
+            step_number=step,
+            max_steps=max_steps,
+            recent_actions=list(recent_action_names),
+            tool_history=history[:step],
+            cost_so_far=min(step * cost_per_step, cost_budget),
+            cost_budget=cost_budget,
+        )
+        action_index = select_action(snapshot)
+        states.append(vectorize(snapshot))
+        actions.append(action_index)
+        recent_action_names.append(ActionSpace.decode(action_index))
+    return states, actions
 
 
 def generate_episodes(num_episodes: int = 1500, seed: int = 42) -> tuple[np.ndarray, np.ndarray]:
@@ -93,30 +131,10 @@ def generate_episodes(num_episodes: int = 1500, seed: int = 42) -> tuple[np.ndar
     rng = random.Random(seed)
     states: list[np.ndarray] = []
     actions: list[int] = []
-
     for _ in range(num_episodes):
-        category = rng.choice(_CATEGORIES)
-        max_steps = _EPISODE_LENGTH if category == "budget_exhaustion" else _EPISODE_LENGTH * 5
-        cost_budget = 10.0
-        history = _build_episode_history(category, rng)
-
-        recent_action_names: list[str] = []
-        for step in range(1, len(history) + 1):
-            snapshot = TrajectorySnapshot(
-                run_id=f"synthetic-{category}",
-                objective="synthetic training objective",
-                step_number=step,
-                max_steps=max_steps,
-                recent_actions=list(recent_action_names),
-                tool_history=history[:step],
-                cost_so_far=min(step * (cost_budget / _EPISODE_LENGTH), cost_budget),
-                cost_budget=cost_budget,
-            )
-            action_index = select_action(snapshot)
-            states.append(vectorize(snapshot))
-            actions.append(action_index)
-            recent_action_names.append(ActionSpace.decode(action_index))
-
+        episode_states, episode_actions = generate_episode(rng.choice(_CATEGORIES), rng)
+        states.extend(episode_states)
+        actions.extend(episode_actions)
     return np.stack(states).astype(np.float32), np.array(actions, dtype=np.int64)
 
 

@@ -41,13 +41,33 @@ class TestBcTrainerMechanics(unittest.TestCase):
         self.assertEqual(logits.shape, (5, ActionSpace.N))
         self.assertEqual(value.shape, (5, 1))
 
+    def test_same_seed_produces_identical_weights(self):
+        model_a, _ = bc_trainer.train_from_arrays(self.states, self.actions, epochs=3, seed=5, verbose=False)
+        model_b, _ = bc_trainer.train_from_arrays(self.states, self.actions, epochs=3, seed=5, verbose=False)
+        for (name, a), (_, b) in zip(model_a.state_dict().items(), model_b.state_dict().items()):
+            torch.testing.assert_close(a, b, msg=name)
+
+    def test_early_stopping_ends_before_max_epochs(self):
+        # Random labels on random features: val_loss can't keep improving.
+        _model, history = bc_trainer.train_from_arrays(self.states, self.actions, epochs=200, patience=3,
+                                                         verbose=False)
+        self.assertLess(len(history), 200)
+
+    def test_diverged_training_raises_instead_of_loading_none(self):
+        nan_states = np.full_like(self.states, np.nan)
+        with self.assertRaises(RuntimeError):
+            bc_trainer.train_from_arrays(nan_states, self.actions, epochs=2, verbose=False)
+
     def test_rollout_dataset_loads_and_concatenates_multiple_npz_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             gen.generate_and_save(num_episodes=5, output_path=str(Path(tmpdir) / "a.npz"), seed=1)
             gen.generate_and_save(num_episodes=5, output_path=str(Path(tmpdir) / "b.npz"), seed=2)
 
+            expected_rows = (len(gen.generate_episodes(num_episodes=5, seed=1)[1])
+                             + len(gen.generate_episodes(num_episodes=5, seed=2)[1]))
+
             dataset = bc_trainer.RolloutDataset(str(Path(tmpdir) / "*.npz"))
-            self.assertEqual(len(dataset), 200)  # 5 episodes x 20 steps x 2 files
+            self.assertEqual(len(dataset), expected_rows)
             state, action = dataset[0]
             self.assertEqual(state.shape, (STATE_DIM,))
             self.assertTrue(0 <= action.item() < ActionSpace.N)

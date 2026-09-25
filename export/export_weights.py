@@ -51,10 +51,17 @@ def pack_weights(model: ActorCritic) -> tuple[dict, bytes]:
         chunks.append(flat.tobytes())
         offset += flat.size
 
+    # eps isn't in state_dict, so read it off the modules rather than
+    # hardcoding it - the manifest carries a single value, so every LayerNorm
+    # must agree.
+    eps_values = {m.eps for m in model.modules() if isinstance(m, torch.nn.LayerNorm)}
+    if len(eps_values) != 1:
+        raise ValueError(f"expected every LayerNorm to share one eps, found {sorted(eps_values)}")
+
     manifest = {
         "state_dim": model.state_dim,
         "action_dim": model.action_dim,
-        "layer_norm_eps": 1e-5,
+        "layer_norm_eps": eps_values.pop(),
         "tensors": tensors_meta,
     }
     return manifest, b"".join(chunks)

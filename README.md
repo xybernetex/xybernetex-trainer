@@ -68,17 +68,15 @@ follows that same recipe, not hierarchy's.
   trajectories fully offline, at zero cost, across five categories
   (normal / stuck-loop / error-recovery / risky-tool / budget-exhaustion) -
   the actual starting point for training, mirroring worker-prod's own
-  1500-episode offline bootstrap. 1500 episodes -> 30,000 labeled steps;
-  `CONTINUE` still dominates (85%) but every reachable action is represented
-  (see the known gap above for the two that aren't). **Known confound**:
-  each category's trigger always occurs at the same fixed step position, so
-  it's always paired with the same budget/history state that position
-  implies - the model learns the real causal features fine (verified
-  directly against its own training examples), but this dataset can't
-  distinguish that from having learned the position confound instead. See
-  the module's own docstring. `replay_loader.py` is a placeholder for
-  parsing real logged OpenClaw sessions once Pass 1 (observe-only) logging
-  exists - blocked for now.
+  1500-episode offline bootstrap. Each episode draws its own length (12-30
+  steps), trigger position, and budgets, and only budget-exhaustion
+  episodes actually run out - an earlier fixed-shape version ended every
+  episode in TERMINATE and pinned each trigger to one position (see the
+  module docstring). 1500 episodes -> ~31,500 labeled steps; `CONTINUE`
+  dominates (91%) but every reachable action is represented (see the known
+  gap above for the two that aren't). `replay_loader.py` is a placeholder
+  for parsing real logged OpenClaw sessions once Pass 1 (observe-only)
+  logging exists - blocked for now.
 - **Export** (`export/export_weights.py`): packs a trained checkpoint into
   `manifest.json` + `weights.bin` for `xybernetex-cfworker`, reading the
   tensor list directly off `model.state_dict()` rather than hardcoding
@@ -92,19 +90,22 @@ follows that same recipe, not hierarchy's.
   Abramowitz & Stegun erf approximation rather than the cruder tanh-GELU
   shortcut, to keep that same tight numerical parity on the JS side too.
 
-## Status (2026-09-24)
+## Status (2026-09-25)
 
-Every module is real and tested now (59 tests) - `chassis/`, `data/`,
-`teacher/`, `train/`, and `export/`. `train/bc_trainer.py`'s trained policy
-correctly classifies >80% of every reachable action on a fresh,
-never-trained-on evaluation set (>90% for `CONTINUE`). Two known, documented
-limitations, not silently papered over: `MODIFY_ACTION`/`NARROW_TOOLS` are
-unreachable by the current teacher (see Teacher above), and the synthetic
-dataset confounds each category's trigger with a fixed step position (see
-Data above). Remaining work is on the `xybernetex-cfworker` side: its
-`src/policy.js`/`src/index.js` stubs need to implement the same forward pass
-`export/export_weights.py.reference_forward()` already specifies and tests
-against.
+Every module is real and tested (68 tests). The current checkpoint scores
+100% on every reachable action except `CONTINUE` (99.6%) on a fresh,
+never-trained-on evaluation set, and matches the teacher on hand-crafted
+snapshots with isolated triggers - e.g. step 19 of 100 -> `CONTINUE`, step
+19 of 20 -> `TERMINATE` - so it's reading budgets, not episode position.
+
+Known, documented limitations:
+- `MODIFY_ACTION`/`NARROW_TOOLS` are unreachable by the current teacher
+  (see Teacher above).
+- The policy partly leans on its own previous action: two consecutive
+  failures with an *empty* action history get `INJECT_CONTEXT` instead of
+  the teacher's `REQUEST_USER` (the same situation mid-episode, where the
+  first failure already produced `INJECT_CONTEXT`, is 300/300). Matters for
+  sessions the supervisor joins partway through.
 
 ## Setup
 

@@ -1,3 +1,4 @@
+import random
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,6 +8,8 @@ import numpy as np
 from chassis.action_space import ActionSpace
 from chassis.state_vectorizer import STATE_DIM
 from data import synthetic_generator as gen
+
+TERMINATE = ActionSpace.encode("TERMINATE")
 
 
 class TestSyntheticGenerator(unittest.TestCase):
@@ -28,6 +31,35 @@ class TestSyntheticGenerator(unittest.TestCase):
         seen = {ActionSpace.decode(a) for a in np.unique(actions)}
         for expected in ("CONTINUE", "REPLAN", "BLOCK_ACTION", "REQUEST_USER", "TERMINATE"):
             self.assertIn(expected, seen, f"{expected} never appeared in 300 synthetic episodes")
+
+    def test_only_budget_exhaustion_episodes_terminate(self):
+        """Regression test for a code-review finding (2026-09-25): the cost
+        budget used to run out at the end of EVERY episode, so every category
+        ended in TERMINATE and the model learned "late in the episode =>
+        TERMINATE" instead of "budget is actually low => TERMINATE"."""
+        rng = random.Random(0)
+        for category in ("normal", "stuck_loop", "error_recovery", "risky_tool"):
+            for _ in range(100):
+                _states, actions = gen.generate_episode(category, rng)
+                self.assertNotIn(TERMINATE, actions, category)
+
+    def test_budget_exhaustion_episodes_do_terminate(self):
+        rng = random.Random(0)
+        for _ in range(100):
+            _states, actions = gen.generate_episode("budget_exhaustion", rng)
+            self.assertEqual(actions[-1], TERMINATE)
+
+    def test_trigger_positions_vary(self):
+        """The other half of the same finding: triggers used to sit at a fixed
+        position, so the dataset couldn't tell "learned the causal feature"
+        apart from "learned the position"."""
+        rng = random.Random(0)
+        block_positions = set()
+        for _ in range(100):
+            _states, actions = gen.generate_episode("risky_tool", rng)
+            block_positions.update(i for i, a in enumerate(actions)
+                                   if ActionSpace.decode(a) in ("BLOCK_ACTION", "REQUEST_USER"))
+        self.assertGreater(len(block_positions), 10)
 
     def test_actions_are_valid_indices(self):
         _, actions = gen.generate_episodes(num_episodes=20)

@@ -38,6 +38,10 @@ LR: float = 1e-3
 WEIGHT_DECAY: float = 1e-4
 LABEL_SMOOTH: float = 0.05
 VAL_FRACTION: float = 0.1
+# The first full training run's val_loss plateaued by ~epoch 20 of 120 - the
+# remaining ~80% of runtime moved val_loss by 0.3%.
+EARLY_STOP_PATIENCE: int = 15
+SEED: int = 0
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -135,18 +139,22 @@ def _run_epoch(model: ActorCritic, loader: DataLoader, optimizer=None, class_wei
 
 def train_from_arrays(states: np.ndarray, actions: np.ndarray, *, epochs: int = EPOCHS,
                        batch_size: int = BATCH_SIZE, lr: float = LR, val_fraction: float = VAL_FRACTION,
-                       verbose: bool = True):
+                       patience: int = EARLY_STOP_PATIENCE, seed: int = SEED, verbose: bool = True):
     """Trains a fresh ActorCritic on already-loaded (states, actions) arrays.
     Returns (model, history) - model has the best-val_loss weights restored,
-    not necessarily the final epoch's. Separated from RolloutDataset/train()
-    so this core loop is testable against a small in-memory dataset without
-    needing real .npz files on disk."""
+    not necessarily the final epoch's. Stops early once val_loss hasn't
+    improved for `patience` epochs. Seeded end to end (init, split, shuffle),
+    so the same data and seed produce the same checkpoint. Separated from
+    RolloutDataset/train() so this core loop is testable against a small
+    in-memory dataset without needing real .npz files on disk."""
+    torch.manual_seed(seed)
     actions_t = torch.tensor(actions, dtype=torch.long)
     dataset = TensorDataset(torch.tensor(states, dtype=torch.float32), actions_t)
     n_val = max(1, int(len(dataset) * val_fraction))
     n_train = len(dataset) - n_val
-    train_set, val_set = random_split(dataset, [n_train, n_val])
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+    train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(seed))
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,
+                              generator=torch.Generator().manual_seed(seed))
     val_loader = DataLoader(val_set, batch_size=batch_size)
 
     class_weights = _class_weights(actions_t[train_set.indices], ActionSpace.N).to(device)
@@ -156,6 +164,7 @@ def train_from_arrays(states: np.ndarray, actions: np.ndarray, *, epochs: int = 
 
     best_val_loss = float("inf")
     best_state = None
+    epochs_since_best = 0
     history = []
 
     for epoch in range(epochs):
@@ -167,10 +176,23 @@ def train_from_arrays(states: np.ndarray, actions: np.ndarray, *, epochs: int = 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
+            epochs_since_best = 0
+        else:
+            epochs_since_best += 1
 
-        if verbose and (epoch % 20 == 0 or epoch == epochs - 1):
+        stopping = epochs_since_best >= patience
+        if verbose and (epoch % 20 == 0 or epoch == epochs - 1 or stopping):
             print(f"  epoch {epoch:4d}  train_loss={train_loss:.4f}  train_acc={train_acc:.4f}  "
                   f"val_loss={val_loss:.4f}  val_acc={val_acc:.4f}")
+        if stopping:
+            if verbose:
+                print(f"  early stop: no val_loss improvement for {patience} epochs")
+            break
+
+    if best_state is None:
+        # Every val_loss was NaN/inf (NaN < inf is False), so nothing was ever
+        # worth keeping - fail loudly rather than load_state_dict(None).
+        raise RuntimeError("val_loss was never finite - training diverged; no checkpoint to restore")
 
     model.load_state_dict(best_state)
     model.eval()

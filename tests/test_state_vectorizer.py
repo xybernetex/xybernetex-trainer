@@ -32,8 +32,8 @@ class TestStateVectorizer(unittest.TestCase):
     def test_repeat_detection(self):
         same_twice = _snapshot(tool_history=[_call(params={"q": "a"}), _call(params={"q": "a"})])
         different = _snapshot(tool_history=[_call(params={"q": "a"}), _call(params={"q": "b"})])
-        self.assertEqual(sv.vectorize(same_twice)[2], 1.0)
-        self.assertEqual(sv.vectorize(different)[2], 0.0)
+        self.assertGreater(sv.vectorize(same_twice)[3], 0.0)
+        self.assertEqual(sv.vectorize(different)[3], 0.0)
 
     def test_consecutive_repeat_count_scales_with_streak(self):
         one_repeat = _snapshot(tool_history=[_call(params={"q": "a"}), _call(params={"q": "a"})])
@@ -53,11 +53,32 @@ class TestStateVectorizer(unittest.TestCase):
         vec = sv.vectorize(_snapshot(tool_history=history))
         self.assertAlmostEqual(vec[7], 2 / sv._MAX_CONSECUTIVE_ERRORS)
 
-    def test_risky_tool_flag(self):
-        risky = _snapshot(tool_history=[_call(tool_name="shell_exec")])
-        safe = _snapshot(tool_history=[_call(tool_name="web_search")])
-        self.assertEqual(sv.vectorize(risky)[8], 1.0)
-        self.assertEqual(sv.vectorize(safe)[8], 0.0)
+    def test_risk_tiers_get_separate_bits(self):
+        """Regression test: the two tiers used to share one bit, so the policy
+        couldn't tell BLOCK_ACTION cases from REQUEST_USER ones."""
+        destructive = sv.vectorize(_snapshot(tool_history=[_call(tool_name="shell_exec")]))
+        sensitive = sv.vectorize(_snapshot(tool_history=[_call(tool_name="send_email")]))
+        safe = sv.vectorize(_snapshot(tool_history=[_call(tool_name="web_search")]))
+        self.assertEqual((destructive[8], destructive[2]), (1.0, 0.0))
+        self.assertEqual((sensitive[8], sensitive[2]), (0.0, 1.0))
+        self.assertEqual((safe[8], safe[2]), (0.0, 0.0))
+
+    def test_risk_tier_matches_whole_tokens_not_substrings(self):
+        # Each of these was misclassified by the old substring matcher.
+        for benign in ("google_drive_file_retrieval", "format_document", "confirm_order",
+                       "platform_status", "dropdown_select", "postgres_query"):
+            self.assertIsNone(sv.risk_tier(benign), benign)
+
+    def test_risk_tier_still_catches_real_risky_names(self):
+        for name, tier in (("delete_file", "destructive"), ("drop_table", "destructive"),
+                           ("shell_exec", "destructive"), ("run_command", "destructive"),
+                           ("rm", "destructive"), ("deleteFile", "destructive"),
+                           ("send_email", "sensitive"), ("publish_post", "sensitive"),
+                           ("transfer_funds", "sensitive"), ("sendEmail", "sensitive")):
+            self.assertEqual(sv.risk_tier(name), tier, name)
+
+    def test_risk_tier_prefers_destructive_when_both_match(self):
+        self.assertEqual(sv.risk_tier("delete_and_publish"), "destructive")
 
     def test_cost_budget_features(self):
         vec = sv.vectorize(_snapshot(cost_so_far=3.0, cost_budget=10.0))

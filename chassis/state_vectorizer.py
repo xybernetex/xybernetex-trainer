@@ -12,13 +12,13 @@ zero I/O side effects - see chassis/__init__.py.
 Structural layout (indices into the first _STRUCT_DIM slots):
   [0]  step_number / max_steps
   [1]  (max_steps - step_number) / max_steps           - remaining budget
-  [2]  is_repeat_of_previous_call (0/1)                - same tool+params as the prior call
+  [2]  is_sensitive_tool (0/1)                         - most recent call is SENSITIVE tier
   [3]  consecutive_repeat_count, normalized             - the loop-killer signal
   [4]  recent success_rate (last up to _RECENT_WINDOW tool calls)
   [5]  recent timeout_rate
   [6]  recent error_rate (failed, not timed out)
   [7]  consecutive_error_count, normalized             - trailing errors specifically
-  [8]  is_risky_tool (0/1)                             - most recent call matches a risky category
+  [8]  is_destructive_tool (0/1)                       - most recent call is DESTRUCTIVE tier
   [9]  cost_so_far / cost_budget, capped at 1.0
   [10] remaining_budget_fraction
   [11] goal_drift_score, or 0.0 if not computed for this snapshot
@@ -28,6 +28,8 @@ x ACTION_COUNT actions, oldest first, flattened - same shape as worker-prod's
 own action-history block, resized for this vocabulary's ACTION_COUNT.
 """
 from __future__ import annotations
+
+import re
 
 import numpy as np
 
@@ -51,34 +53,52 @@ _MAX_CONSECUTIVE_ERRORS: float = 5.0
 # actions have a real external effect (money moves, an email goes out, a
 # release happens) but aren't inherently wrong the way a stray `rm` is, so
 # the teacher asks a human instead (REQUEST_USER) rather than blocking.
-# is_risky_tool() stays as a single coarse bit for the state vector, which
-# only needs "is this situation elevated" - the tier distinction is a
-# decision the teacher makes, not something the policy's input needs to see
-# split apart.
-_DESTRUCTIVE_TOOL_KEYWORDS: frozenset[str] = frozenset({
-    "exec", "shell", "bash", "powershell", "eval", "run_command",
-    "delete", "remove", "rm", "drop", "truncate", "purge",
-})
-_SENSITIVE_TOOL_KEYWORDS: frozenset[str] = frozenset({
-    "payment", "charge", "transfer", "withdraw",
-    "send_email", "post", "publish", "deploy",
-})
+# The state vector carries each tier as its own bit ([2] and [8]). An earlier
+# version collapsed them into one "is risky" bit on the theory that the tier
+# split was only the teacher's concern - but behavioral cloning can only
+# imitate distinctions its input can see: with one bit, the trained policy
+# got sensitive-tool REQUEST_USER right on 2/76 cases, predicting
+# BLOCK_ACTION for the rest. ([2] used to be an is-repeat bit, which was
+# fully derivable from [3].)
+#
+# Keywords are matched as whole name TOKENS (split on separators and
+# camelCase), never as raw substrings - substring matching misclassified
+# plenty of benign tools: "eval" in "retrieval", "rm" in "format"/"confirm"/
+# "platform", "drop" in "dropdown", "post" in "postgres". Multi-word keywords
+# ("run_command", "send_email") match as a contiguous token run.
+_DESTRUCTIVE_TOOL_KEYWORDS: tuple[tuple[str, ...], ...] = (
+    ("exec",), ("shell",), ("bash",), ("powershell",), ("eval",), ("run", "command"),
+    ("delete",), ("remove",), ("rm",), ("drop",), ("truncate",), ("purge",),
+)
+_SENSITIVE_TOOL_KEYWORDS: tuple[tuple[str, ...], ...] = (
+    ("payment",), ("charge",), ("transfer",), ("withdraw",),
+    ("send", "email"), ("post",), ("publish",), ("deploy",),
+)
+
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_TOKEN_SEPARATOR = re.compile(r"[^a-z0-9]+")
+
+
+def _name_tokens(tool_name: str) -> list[str]:
+    spaced = _CAMEL_BOUNDARY.sub("_", tool_name).lower()
+    return [t for t in _TOKEN_SEPARATOR.split(spaced) if t]
+
+
+def _contains_run(tokens: list[str], keyword: tuple[str, ...]) -> bool:
+    n = len(keyword)
+    return any(tuple(tokens[i:i + n]) == keyword for i in range(len(tokens) - n + 1))
 
 
 def risk_tier(tool_name: str) -> str | None:
     """Returns "destructive", "sensitive", or None. Checks destructive
     first - a name matching both (unlikely, but e.g. "delete_and_publish")
     should be treated as the more severe tier."""
-    name = tool_name.lower()
-    if any(keyword in name for keyword in _DESTRUCTIVE_TOOL_KEYWORDS):
+    tokens = _name_tokens(tool_name)
+    if any(_contains_run(tokens, kw) for kw in _DESTRUCTIVE_TOOL_KEYWORDS):
         return "destructive"
-    if any(keyword in name for keyword in _SENSITIVE_TOOL_KEYWORDS):
+    if any(_contains_run(tokens, kw) for kw in _SENSITIVE_TOOL_KEYWORDS):
         return "sensitive"
     return None
-
-
-def is_risky_tool(tool_name: str) -> bool:
-    return risk_tier(tool_name) is not None
 
 
 def _same_call(a, b) -> bool:
@@ -121,8 +141,8 @@ def _build_structural(snapshot) -> np.ndarray:
     s[1] = (snapshot.max_steps - snapshot.step_number) / horizon
 
     history = snapshot.tool_history
-    if len(history) >= 2:
-        s[2] = 1.0 if _same_call(history[-1], history[-2]) else 0.0
+    tier = risk_tier(history[-1].tool_name) if history else None
+    s[2] = 1.0 if tier == "sensitive" else 0.0
     s[3] = min(consecutive_repeat_count(history) / _MAX_CONSECUTIVE_REPEAT, 1.0)
 
     recent = history[-_RECENT_WINDOW:]
@@ -132,7 +152,7 @@ def _build_structural(snapshot) -> np.ndarray:
         s[6] = sum(1 for c in recent if not c.success and not c.timed_out) / len(recent)
     s[7] = min(consecutive_error_count(history) / _MAX_CONSECUTIVE_ERRORS, 1.0)
 
-    s[8] = 1.0 if (history and is_risky_tool(history[-1].tool_name)) else 0.0
+    s[8] = 1.0 if tier == "destructive" else 0.0
 
     if snapshot.cost_budget > 0:
         s[9] = min(snapshot.cost_so_far / snapshot.cost_budget, 1.0)
