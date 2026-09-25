@@ -56,20 +56,29 @@ follows that same recipe, not hierarchy's.
   respectively). A classifier trained on this teacher's labels alone will
   never learn to predict those two - see the module's own docstring before
   treating it as feature-complete.
-- **Training** (`train/bc_trainer.py`, not yet implemented): cross-entropy
-  behavioral cloning against the teacher's labels. No live rollouts, no
-  policy-gradient RL, no reward function needed at all for v1 - this
-  sidesteps the sparse/delayed-reward problem a supervisor's task naturally
-  has, rather than trying to solve it.
+- **Training** (`train/bc_trainer.py`): cross-entropy behavioral cloning
+  against the teacher's labels, with sqrt-dampened inverse-frequency class
+  weighting (plain inverse frequency overcorrected badly - see the module's
+  own docstring) and best-checkpoint-by-val_loss tracking, the same lesson
+  Agent Drift Lab's hierarchy experiment learned about overfitting on small
+  datasets. No live rollouts, no policy-gradient RL, no reward function
+  needed at all for v1 - this sidesteps the sparse/delayed-reward problem a
+  supervisor's task naturally has, rather than trying to solve it.
 - **Data** (`data/`): `synthetic_generator.py` fabricates plausible
   trajectories fully offline, at zero cost, across five categories
   (normal / stuck-loop / error-recovery / risky-tool / budget-exhaustion) -
   the actual starting point for training, mirroring worker-prod's own
   1500-episode offline bootstrap. 1500 episodes -> 30,000 labeled steps;
   `CONTINUE` still dominates (85%) but every reachable action is represented
-  (see the known gap above for the two that aren't). `replay_loader.py` is a
-  placeholder for parsing real logged OpenClaw sessions once Pass 1
-  (observe-only) logging exists - blocked for now.
+  (see the known gap above for the two that aren't). **Known confound**:
+  each category's trigger always occurs at the same fixed step position, so
+  it's always paired with the same budget/history state that position
+  implies - the model learns the real causal features fine (verified
+  directly against its own training examples), but this dataset can't
+  distinguish that from having learned the position confound instead. See
+  the module's own docstring. `replay_loader.py` is a placeholder for
+  parsing real logged OpenClaw sessions once Pass 1 (observe-only) logging
+  exists - blocked for now.
 - **Export** (`export/export_weights.py`, not yet implemented): packs a
   trained checkpoint into `manifest.json` + `weights.bin` for
   `xybernetex-cfworker`. The *only* place in either repo that needs to know
@@ -79,13 +88,15 @@ follows that same recipe, not hierarchy's.
 
 ## Status (2026-09-24)
 
-`chassis/`, `data/trajectory_schema.py`, `data/synthetic_generator.py`, and
-`teacher/heuristic_teacher.py` are all real and tested (42 tests). Only
-`train/bc_trainer.py` and `export/export_weights.py` remain stubs. Known
-limitation: the heuristic teacher never produces `MODIFY_ACTION` or
-`NARROW_TOOLS` - see the Teacher section above. Build order:
-`bc_trainer.py` (unblocked - a real labeled dataset now exists via
-`synthetic_generator.generate_and_save()`) -> `export_weights.py`.
+Everything except `export/export_weights.py` is real and tested (53 tests).
+`train/bc_trainer.py`'s trained policy correctly classifies >80% of every
+reachable action on a fresh, never-trained-on evaluation set (>90% for
+`CONTINUE`). Two known, documented limitations, not silently papered over:
+`MODIFY_ACTION`/`NARROW_TOOLS` are unreachable by the current teacher (see
+Teacher above), and the synthetic dataset confounds each category's trigger
+with a fixed step position (see Data above). Only `export_weights.py`
+remains - the last step before a checkpoint can actually reach
+`xybernetex-cfworker`.
 
 ## Setup
 

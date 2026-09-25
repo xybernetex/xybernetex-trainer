@@ -24,6 +24,23 @@ interventions:
   - "budget_exhaustion": max_steps set equal to the episode length (instead
     of generously larger) so the step budget genuinely runs low near the
     end - exercises TERMINATE
+
+Known confound, found while debugging train/bc_trainer.py's tests (2026-09-24):
+every category's distinguishing feature always occurs at a FIXED step
+position (the risky call is always the 20th and last call; the stuck loop
+is always the final 4 steps; etc.), which means it's also always paired
+with the same step-budget/action-history state that position implies (e.g.
+a risky-tool example is always at full cost-budget consumption with a
+fully-populated 16-step action history). A model trained on this can learn
+the real signal (risk_tier, repeat count, ...) just fine - confirmed
+directly by checking predictions against the model's OWN real training
+examples, not just aggregate accuracy - but it also means this dataset
+can't distinguish "the model learned the causal feature" from "the model
+learned the position/budget confound" the way a hand-crafted, isolated test
+snapshot would expect. Worth varying trigger position within each category
+before trusting this dataset for anything beyond what
+tests/test_bc_trainer.py currently checks (per-class accuracy against a
+fresh sample of the SAME generator, which doesn't probe the confound).
 """
 from __future__ import annotations
 
