@@ -51,6 +51,7 @@ def _snapshot_from_json(raw: dict) -> TrajectorySnapshot:
             error=call.get("error"),
             timed_out=call.get("timed_out", False),
             risk=call.get("risk"),
+            authorization=call.get("authorization"),
         )
         for call in raw.get("tool_history", [])
     ]

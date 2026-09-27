@@ -28,6 +28,11 @@ class ToolCallRecord:
     # falls back to judging the tool NAME (state_vectorizer.effective_risk_tier),
     # which is all synthetic data carries.
     risk: str | None = None
+    # Whether the user's own request covers this call - "requested",
+    # "own_artifact" (the agent's own earlier creation) or "unrequested" -
+    # judged on the user's machine by the plugin's src/authz.js for risky calls
+    # only. None means not assessed. Not yet a vectorizer feature.
+    authorization: str | None = None
 
 
 @dataclass
@@ -37,6 +42,7 @@ class ProposedToolCall:
     params: dict
     risk: str | None = None
     tool_call_id: str | None = None
+    authorization: str | None = None
 
 
 @dataclass
