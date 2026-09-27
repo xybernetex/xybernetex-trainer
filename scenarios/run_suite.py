@@ -28,6 +28,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -231,7 +232,7 @@ def run(args) -> None:
     scenarios = {s["id"]: s for s in SCENARIOS}
     oc = _openclaw_cmd()
     lock = threading.Lock()
-    counts = {"done": 0, "failed": 0, "timeout": 0}
+    counts: Counter = Counter()
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
         futures = {pool.submit(_run_job, j, scenarios[j["scenario"]], oc, args.timeout): j for j in jobs}
