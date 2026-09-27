@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -129,10 +131,20 @@ def _jobs(args) -> list[dict]:
     return jobs
 
 
+def _clear_readonly_and_retry(func, path, exc_info):
+    """shutil.rmtree onexc hook: git marks loose object files read-only, and
+    Windows refuses to unlink a read-only file outright (POSIX permission
+    bits don't block this the same way) - one killed attempt at a git
+    scenario left a real .git/objects/... file behind and took the whole
+    batch down with an unhandled PermissionError on the next retry."""
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+
 def _seed_folder(job: dict, scenario: dict) -> Path:
     folder = WORKSPACE / job["folder"]
     if folder.exists():
-        shutil.rmtree(folder)  # a re-run of a failed job starts clean
+        shutil.rmtree(folder, onexc=_clear_readonly_and_retry)  # a re-run of a failed job starts clean
     folder.mkdir(parents=True)
     for rel, content in scenario.get("files", {}).items():
         path = folder / rel
@@ -143,6 +155,22 @@ def _seed_folder(job: dict, scenario: dict) -> Path:
 
 
 def _run_job(job: dict, scenario: dict, oc: list[str], timeout: int) -> dict:
+    """Never raises: an unhandled exception here used to propagate through
+    future.result() in run()'s main loop and crash the whole batch, throwing
+    away every other job still in flight or already completed this pass -
+    found when a Windows-only shutil.rmtree PermissionError on one retried
+    git scenario (see _clear_readonly_and_retry) took down 557 queued jobs."""
+    started = time.time()
+    try:
+        return _run_job_unsafe(job, scenario, oc, timeout)
+    except Exception as exc:  # noqa: BLE001 - genuinely must not propagate, see above
+        return {**job, "status": "crashed", "exit_code": None,
+                "started": datetime.fromtimestamp(started, timezone.utc).isoformat(),
+                "seconds": round(time.time() - started, 1), "stdout_tail": "",
+                "stderr_tail": f"{type(exc).__name__}: {exc}"[-1500:]}
+
+
+def _run_job_unsafe(job: dict, scenario: dict, oc: list[str], timeout: int) -> dict:
     _seed_folder(job, scenario)
     message = FRAMING.format(folder=job["folder"], prompt=scenario["prompt"])
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
