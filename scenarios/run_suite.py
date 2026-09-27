@@ -155,6 +155,21 @@ def _seed_folder(job: dict, scenario: dict) -> Path:
     return folder
 
 
+def _reply_text(stdout: str) -> str | None:
+    """The agent's final reply from `openclaw agent --json` output. Kept in the
+    manifest because stdout_tail only holds the end of the JSON, which is
+    metadata - scenarios/outcomes.py needs the reply to grade text-only tasks."""
+    try:
+        data = json.loads(stdout)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    payloads = (data.get("result") or {}).get("payloads") or []
+    texts = [p["text"] for p in payloads if isinstance(p, dict) and isinstance(p.get("text"), str)]
+    return "\n\n".join(texts)[-4000:] or None
+
+
 def _run_job(job: dict, scenario: dict, oc: list[str], timeout: int) -> dict:
     """Never raises: an unhandled exception here used to propagate through
     future.result() in run()'s main loop and crash the whole batch, throwing
@@ -200,6 +215,7 @@ def _run_job_unsafe(job: dict, scenario: dict, oc: list[str], timeout: int) -> d
         "exit_code": code,
         "started": datetime.fromtimestamp(started, timezone.utc).isoformat(),
         "seconds": round(time.time() - started, 1),
+        "reply": _reply_text(out),
         "stdout_tail": out[-3000:],
         "stderr_tail": err[-1500:],
     }
