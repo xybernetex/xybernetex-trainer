@@ -20,8 +20,10 @@ interventions:
     (different params each, so this doesn't also trigger repeat-detection) -
     exercises INJECT_CONTEXT-then-REQUEST_USER as failures accumulate, and
     (at 5+) the escalation holding once consecutive_error_count saturates
-  - "risky_tool": one destructive or sensitive call somewhere in the episode
-    - exercises BLOCK_ACTION / REQUEST_USER
+  - "risky_tool": one to three destructive or sensitive calls somewhere in
+    the episode, each with an authorization label (requested / own_artifact
+    / unrequested / not assessed) - exercises BLOCK_ACTION / REQUEST_USER
+    when the user didn't ask, and CONTINUE when they did
   - "budget_exhaustion": either the step budget or the cost budget (chosen
     per episode) is sized to run out partway through, with several steps
     still running afterward while it stays exhausted - exercises TERMINATE,
@@ -68,7 +70,7 @@ import random
 import numpy as np
 
 from chassis.action_space import ActionSpace
-from chassis.state_vectorizer import vectorize
+from chassis.state_vectorizer import vectorize_v3
 from data.trajectory_schema import ToolCallRecord, TrajectorySnapshot
 from teacher.heuristic_teacher import select_action
 
@@ -93,6 +95,15 @@ _ERROR_RUN_MAX: int = 7
 # length from this and the episode's own length.
 _BUDGET_CONTINUATION_MIN: int = 2
 _CATEGORIES: tuple[str, ...] = ("normal", "stuck_loop", "error_recovery", "risky_tool", "budget_exhaustion")
+# Authorization of a risky call (src/authz.js in xybernetex-openclaw). Roughly
+# the real mix: the 2026-09-27 replay of 565 runs labeled destructive calls
+# ~55% requested, ~40% unrequested, the rest the agent's own artifacts; None
+# covers sessions where no user turn was seen. More than one risky call per
+# episode keeps each tier x label pair from being too thin to learn.
+_AUTHORIZATIONS: tuple[tuple[str | None, float], ...] = (
+    ("requested", 0.35), ("own_artifact", 0.15), ("unrequested", 0.35), (None, 0.15),
+)
+_MAX_RISKY_CALLS: int = 3
 
 
 def _random_call(rng: random.Random, *, success: bool = True, risky_pool: tuple[str, ...] | None = None):
@@ -114,7 +125,11 @@ def _build_episode_history(category: str, rng: random.Random, length: int) -> li
         for i in range(start, start + run_len):
             history[i] = _random_call(rng, success=False)
     elif category == "risky_tool":
-        history[rng.randrange(length)] = _random_call(rng, risky_pool=_DESTRUCTIVE_TOOLS + _SENSITIVE_TOOLS)
+        labels, weights = zip(*_AUTHORIZATIONS)
+        for position in rng.sample(range(length), rng.randint(1, _MAX_RISKY_CALLS)):
+            call = _random_call(rng, risky_pool=_DESTRUCTIVE_TOOLS + _SENSITIVE_TOOLS)
+            call.authorization = rng.choices(labels, weights)[0]
+            history[position] = call
     return history
 
 
@@ -195,11 +210,11 @@ def episode_snapshots(category: str, rng: random.Random) -> list[tuple[Trajector
 def generate_episode(category: str, rng: random.Random) -> tuple[list[np.ndarray], list[int]]:
     """One episode of the given category -> (per-step state vectors, per-step teacher action indices)."""
     steps = episode_snapshots(category, rng)
-    return [vectorize(snapshot) for snapshot, _ in steps], [action for _, action in steps]
+    return [vectorize_v3(snapshot) for snapshot, _ in steps], [action for _, action in steps]
 
 
 def generate_episodes(num_episodes: int = 1500, seed: int = 42) -> tuple[np.ndarray, np.ndarray]:
-    """Returns (states, actions): states is (N, STATE_DIM) float32, actions
+    """Returns (states, actions): states is (N, TRAINING_STATE_DIM) float32, actions
     is (N,) int64 - one row per step across every generated episode, ready
     for train/bc_trainer.py's cross-entropy training."""
     rng = random.Random(seed)

@@ -26,6 +26,14 @@ Structural layout (indices into the first _STRUCT_DIM slots):
 [_STRUCT_DIM : STATE_DIM] one-hot recent-action history, HISTORY_LEN steps
 x ACTION_COUNT actions, oldest first, flattened - same shape as worker-prod's
 own action-history block, resized for this vocabulary's ACTION_COUNT.
+
+That 140-float layout is the frozen xybernetex.state.v1 contract (vectorize).
+xybernetex.state.v3 (vectorize_v3) keeps it unchanged at [0:140] and appends
+the most recent call's authorization as a one-hot at [140:143] - requested,
+own_artifact, unrequested; all zero when not assessed. The label comes from
+xybernetex-openclaw's src/authz.js: whether the user's own request covers the
+call, which risk tier alone can't say. (v2 is the separate pending-call
+proposal layout in proposal_vectorizer.py.)
 """
 from __future__ import annotations
 
@@ -40,6 +48,12 @@ HISTORY_LEN: int = 16
 _STRUCT_DIM: int = 12
 STATE_DIM: int = _STRUCT_DIM + HISTORY_LEN * ACTION_COUNT
 FEATURE_SCHEMA = "xybernetex.state.v1"
+
+AUTHORIZATION_LABELS: tuple[str, ...] = ("requested", "own_artifact", "unrequested")
+FEATURE_SCHEMA_V3 = "xybernetex.state.v3"
+STATE_DIM_V3: int = STATE_DIM + len(AUTHORIZATION_LABELS)
+# What training produces and the newest Worker serves.
+TRAINING_STATE_DIM: int = STATE_DIM_V3
 
 _RECENT_WINDOW: int = 8
 _MAX_CONSECUTIVE_REPEAT: float = 5.0
@@ -192,12 +206,40 @@ def _build_action_history(snapshot) -> np.ndarray:
     return h.flatten()
 
 
-def vectorize(snapshot) -> np.ndarray:
-    if getattr(snapshot, "feature_schema", FEATURE_SCHEMA) != FEATURE_SCHEMA:
-        raise ValueError("v1 vectorizer requires xybernetex.state.v1")
+def authorization_of(call) -> str | None:
+    """The call's recorded authorization label (ToolCallRecord.authorization),
+    or None when not assessed. Shared with teacher/heuristic_teacher.py."""
+    label = getattr(call, "authorization", None)
+    if label is not None and label not in AUTHORIZATION_LABELS:
+        raise ValueError(f"Unknown authorization label {label!r}; expected one of {AUTHORIZATION_LABELS}")
+    return label
+
+
+def _v1_features(snapshot) -> np.ndarray:
     if getattr(snapshot, "proposed_call", None) is not None:
         raise ValueError("pending proposals require the v2 vectorizer")
     structural = _build_structural(snapshot)
     history = _build_action_history(snapshot)
     vec = np.concatenate([structural, history]).astype(np.float32)
     return np.nan_to_num(vec, nan=0.0, posinf=1.0, neginf=0.0)
+
+
+def vectorize(snapshot) -> np.ndarray:
+    if getattr(snapshot, "feature_schema", FEATURE_SCHEMA) != FEATURE_SCHEMA:
+        raise ValueError("v1 vectorizer requires xybernetex.state.v1")
+    return _v1_features(snapshot)
+
+
+def vectorize_v3(snapshot) -> np.ndarray:
+    """v1's 140 features, then the most recent call's authorization one-hot.
+    Accepts snapshots tagged v1 as well as v3: a completed-call snapshot has
+    the same shape either way, authorization being an optional per-call
+    field - so which layout a snapshot gets is decided by the model serving
+    it, not by the plugin that recorded it."""
+    if getattr(snapshot, "feature_schema", FEATURE_SCHEMA) not in (FEATURE_SCHEMA, FEATURE_SCHEMA_V3):
+        raise ValueError("v3 vectorizer requires xybernetex.state.v1 or v3 snapshots")
+    auth = np.zeros(len(AUTHORIZATION_LABELS), dtype=np.float32)
+    label = authorization_of(snapshot.tool_history[-1]) if snapshot.tool_history else None
+    if label is not None:
+        auth[AUTHORIZATION_LABELS.index(label)] = 1.0
+    return np.concatenate([_v1_features(snapshot), auth])

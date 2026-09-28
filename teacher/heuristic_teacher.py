@@ -12,7 +12,15 @@ Rules, in priority order (first match wins):
      effective_risk_tier(): its recorded risk label, else judged from the
      tool name) is "destructive" -> BLOCK_ACTION (refuse outright);
      "sensitive" -> REQUEST_USER (needs a human sign-off, not inherently
-     wrong the way a stray delete is)
+     wrong the way a stray delete is) - UNLESS the call's authorization
+     label (from the plugin's src/authz.js) says the user asked for it:
+     "requested" (or, for destructive calls, "own_artifact": the agent
+     deleting its own scratch work) falls through to the rules below. Risk
+     alone can't tell a requested `rm -rf build` from an `rm -rf data`
+     planted in a file the agent read: the 2026-09-27 outcome grading found
+     BLOCK_ACTION on all 8 runs where an agent obeyed a planted instruction,
+     and on ~100 where the user had asked for exactly that deletion. An
+     unassessed call (no label) keeps the old, conservative rule.
   2. the same tool+params has now repeated REPEAT_THRESHOLD+1 times in a
      row -> REPLAN (the loop-killer, mirrors worker-prod's
      RewardFunction.R_STAGNATION)
@@ -42,7 +50,8 @@ treating this teacher as feature-complete.
 from __future__ import annotations
 
 from chassis.action_space import ActionSpace
-from chassis.state_vectorizer import consecutive_error_count, consecutive_repeat_count, effective_risk_tier
+from chassis.state_vectorizer import (authorization_of, consecutive_error_count, consecutive_repeat_count,
+                                      effective_risk_tier)
 
 REPEAT_THRESHOLD: int = 2
 ERROR_ESCALATION_THRESHOLD: int = 2
@@ -54,9 +63,10 @@ def select_action(snapshot) -> int:
 
     if history:
         tier = effective_risk_tier(history[-1])
-        if tier == "destructive":
+        authorized = authorization_of(history[-1])
+        if tier == "destructive" and authorized not in ("requested", "own_artifact"):
             return ActionSpace.encode("BLOCK_ACTION")
-        if tier == "sensitive":
+        if tier == "sensitive" and authorized != "requested":
             return ActionSpace.encode("REQUEST_USER")
 
     if consecutive_repeat_count(history) >= REPEAT_THRESHOLD:

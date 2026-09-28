@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from chassis.action_space import ActionSpace
-from chassis.state_vectorizer import STATE_DIM
+from chassis.state_vectorizer import TRAINING_STATE_DIM
 from data import synthetic_generator as gen
 
 TERMINATE = ActionSpace.encode("TERMINATE")
@@ -15,7 +15,7 @@ TERMINATE = ActionSpace.encode("TERMINATE")
 class TestSyntheticGenerator(unittest.TestCase):
     def test_output_shapes_and_dtypes(self):
         states, actions = gen.generate_episodes(num_episodes=20)
-        self.assertEqual(states.shape[1], STATE_DIM)
+        self.assertEqual(states.shape[1], TRAINING_STATE_DIM)
         self.assertEqual(states.shape[0], actions.shape[0])
         self.assertEqual(states.dtype, np.float32)
         self.assertEqual(actions.dtype, np.int64)
@@ -122,6 +122,29 @@ class TestSyntheticGenerator(unittest.TestCase):
                                         f"{category} terminated at {used:.2f} used")
         self.assertTrue(reached_high_usage, "no non-exhaustion episode ever reached 65% budget used")
 
+    def test_every_risk_tier_and_authorization_pair_is_covered(self):
+        """The teacher's risky-call decision now depends on the label, so the
+        model has to see each tier x label pair to learn it."""
+        rng = random.Random(0)
+        seen = set()
+        for _ in range(300):
+            for snapshot, _action in gen.episode_snapshots("risky_tool", rng):
+                last = snapshot.tool_history[-1]
+                tier = "destructive" if last.tool_name in gen._DESTRUCTIVE_TOOLS else (
+                    "sensitive" if last.tool_name in gen._SENSITIVE_TOOLS else None)
+                if tier:
+                    seen.add((tier, last.authorization))
+        want = {(t, a) for t in ("destructive", "sensitive") for a in ("requested", "own_artifact", "unrequested", None)}
+        self.assertEqual(want - seen, set())
+
+    def test_requested_risky_calls_are_not_blocked(self):
+        rng = random.Random(1)
+        for _ in range(200):
+            for snapshot, action in gen.episode_snapshots("risky_tool", rng):
+                last = snapshot.tool_history[-1]
+                if last.tool_name in gen._DESTRUCTIVE_TOOLS and last.authorization == "requested":
+                    self.assertNotEqual(ActionSpace.decode(action), "BLOCK_ACTION")
+
     def test_actions_are_valid_indices(self):
         _, actions = gen.generate_episodes(num_episodes=20)
         self.assertTrue(np.all(actions >= 0))
@@ -136,7 +159,7 @@ class TestSyntheticGenerator(unittest.TestCase):
             # a context manager (or .close() is called explicitly).
             with np.load(out_path) as data:
                 self.assertEqual(set(data.files), {"states", "actions"})
-                self.assertEqual(data["states"].shape[1], STATE_DIM)
+                self.assertEqual(data["states"].shape[1], TRAINING_STATE_DIM)
                 self.assertEqual(data["states"].shape[0], data["actions"].shape[0])
 
 

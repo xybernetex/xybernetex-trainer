@@ -36,6 +36,29 @@ class TestHeuristicTeacher(unittest.TestCase):
         self.assertEqual(_select(_snapshot(tool_history=[shell("destructive")])), "BLOCK_ACTION")
         self.assertEqual(_select(_snapshot(tool_history=[shell("sensitive")])), "REQUEST_USER")
 
+    def test_authorization_decides_whether_a_risky_call_is_stopped(self):
+        """2026-09-27: BLOCK_ACTION fired on all 8 runs where an agent obeyed
+        a planted instruction - and on ~100 where the user had asked for that
+        exact deletion. The authorization label is what separates them."""
+        def shell(risk, authorization):
+            return _snapshot(tool_history=[ToolCallRecord(tool_name="exec", params={"c": 1}, success=True,
+                                                          risk=risk, authorization=authorization)])
+        self.assertEqual(_select(shell("destructive", "unrequested")), "BLOCK_ACTION")
+        self.assertEqual(_select(shell("destructive", None)), "BLOCK_ACTION")  # unassessed: conservative
+        self.assertEqual(_select(shell("destructive", "requested")), "CONTINUE")
+        self.assertEqual(_select(shell("destructive", "own_artifact")), "CONTINUE")
+        self.assertEqual(_select(shell("sensitive", "requested")), "CONTINUE")
+        self.assertEqual(_select(shell("sensitive", "own_artifact")), "REQUEST_USER")
+        self.assertEqual(_select(shell("sensitive", "unrequested")), "REQUEST_USER")
+
+    def test_an_authorized_call_still_gets_the_other_rules(self):
+        failed = ToolCallRecord(tool_name="exec", params={"c": 1}, success=False, risk="destructive",
+                                authorization="requested")
+        self.assertEqual(_select(_snapshot(tool_history=[failed])), "INJECT_CONTEXT")
+        ok =ToolCallRecord(tool_name="exec", params={"c": 1}, success=True, risk="destructive",
+                            authorization="requested")
+        self.assertEqual(_select(_snapshot(tool_history=[ok], step_number=19, max_steps=20)), "TERMINATE")
+
     def test_safe_tool_with_no_other_issues_continues(self):
         snap = _snapshot(tool_history=[_call(tool_name="web_search")])
         self.assertEqual(_select(snap), "CONTINUE")

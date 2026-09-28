@@ -159,7 +159,7 @@ def train_from_arrays(states: np.ndarray, actions: np.ndarray, *, epochs: int = 
 
     class_weights = _class_weights(actions_t[train_set.indices], ActionSpace.N).to(device)
 
-    model = ActorCritic().to(device)
+    model = ActorCritic(state_dim=states.shape[1]).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
 
     best_val_loss = float("inf")

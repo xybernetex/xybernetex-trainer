@@ -7,7 +7,7 @@ import torch
 
 from chassis.action_space import ActionSpace
 from chassis.actor_critic import load_policy_bytes
-from chassis.state_vectorizer import STATE_DIM
+from chassis.state_vectorizer import STATE_DIM, TRAINING_STATE_DIM
 from data import synthetic_generator as gen
 from train import bc_trainer
 
@@ -69,7 +69,7 @@ class TestBcTrainerMechanics(unittest.TestCase):
             dataset = bc_trainer.RolloutDataset(str(Path(tmpdir) / "*.npz"))
             self.assertEqual(len(dataset), expected_rows)
             state, action = dataset[0]
-            self.assertEqual(state.shape, (STATE_DIM,))
+            self.assertEqual(state.shape, (TRAINING_STATE_DIM,))
             self.assertTrue(0 <= action.item() < ActionSpace.N)
 
     def test_rollout_dataset_raises_clear_error_when_no_files_match(self):
@@ -91,7 +91,7 @@ class TestBcTrainerMechanics(unittest.TestCase):
 
             with open(model_path, "rb") as f:
                 reloaded = load_policy_bytes(f.read())
-            self.assertEqual(reloaded.state_dim, STATE_DIM)
+            self.assertEqual(reloaded.state_dim, TRAINING_STATE_DIM)
 
 
 class TestBehavioralCloningActuallyLearns(unittest.TestCase):

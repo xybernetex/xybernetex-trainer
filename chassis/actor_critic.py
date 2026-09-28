@@ -25,13 +25,13 @@ import torch
 import torch.nn as nn
 
 from .action_space import ActionSpace
-from .state_vectorizer import STATE_DIM
+from .state_vectorizer import TRAINING_STATE_DIM
 
 ACTION_COUNT: int = ActionSpace.N
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, state_dim: int = STATE_DIM, action_dim: int = ACTION_COUNT) -> None:
+    def __init__(self, state_dim: int = TRAINING_STATE_DIM, action_dim: int = ACTION_COUNT) -> None:
         super().__init__()
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -57,10 +57,12 @@ def save_policy_bytes(model: ActorCritic) -> bytes:
     return buf.getvalue()
 
 
-def load_policy_bytes(data: bytes, state_dim: int = STATE_DIM, action_dim: int = ACTION_COUNT) -> ActorCritic:
-    model = ActorCritic(state_dim=state_dim, action_dim=action_dim)
-    buf = io.BytesIO(data)
-    model.load_state_dict(torch.load(buf, map_location="cpu"))
+def load_policy_bytes(data: bytes) -> ActorCritic:
+    """Dimensions come from the checkpoint itself, so a v1 (140-input) and a
+    v3 (143-input) checkpoint both load without the caller knowing which."""
+    state = torch.load(io.BytesIO(data), map_location="cpu")
+    model = ActorCritic(state_dim=state["trunk.0.weight"].shape[1], action_dim=state["actor.weight"].shape[0])
+    model.load_state_dict(state)
     model.eval()
     return model
 

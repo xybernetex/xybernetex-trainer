@@ -18,6 +18,40 @@ def _call(tool_name="web_search", params=None, success=True, error=None, timed_o
                            error=error, timed_out=timed_out)
 
 
+class TestVectorizerV3(unittest.TestCase):
+    def labelled(self, *labels):
+        return _snapshot(tool_history=[ToolCallRecord("exec", {"c": i}, True, risk="destructive", authorization=a)
+                                       for i, a in enumerate(labels)])
+
+    def test_v1_prefix_is_unchanged_and_authorization_is_a_one_hot_of_the_last_call(self):
+        snap = self.labelled("requested", "unrequested")
+        v3 = sv.vectorize_v3(snap)
+        self.assertEqual(v3.shape, (sv.STATE_DIM_V3,))
+        self.assertEqual(v3.dtype, np.float32)
+        np.testing.assert_array_equal(v3[:sv.STATE_DIM], sv.vectorize(snap))
+        np.testing.assert_array_equal(v3[sv.STATE_DIM:], [0, 0, 1])
+        np.testing.assert_array_equal(sv.vectorize_v3(self.labelled("own_artifact"))[sv.STATE_DIM:], [0, 1, 0])
+
+    def test_unassessed_and_empty_history_are_all_zero(self):
+        self.assertFalse(sv.vectorize_v3(self.labelled(None))[sv.STATE_DIM:].any())
+        self.assertFalse(sv.vectorize_v3(_snapshot())[sv.STATE_DIM:].any())
+
+    def test_v1_ignores_the_label_so_the_deployed_contract_holds(self):
+        np.testing.assert_array_equal(sv.vectorize(self.labelled("requested")), sv.vectorize(self.labelled(None)))
+
+    def test_schema_tags_and_bad_labels_are_rejected(self):
+        snap = self.labelled("requested")
+        snap.feature_schema = sv.FEATURE_SCHEMA_V3
+        sv.vectorize_v3(snap)
+        with self.assertRaises(ValueError):
+            sv.vectorize(snap)
+        snap.feature_schema = "xybernetex.state.v2"
+        with self.assertRaises(ValueError):
+            sv.vectorize_v3(snap)
+        with self.assertRaises(ValueError):
+            sv.vectorize_v3(self.labelled("approved"))
+
+
 class TestStateVectorizer(unittest.TestCase):
     def test_output_shape_and_dtype(self):
         vec = sv.vectorize(_snapshot())

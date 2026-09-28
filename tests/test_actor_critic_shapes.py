@@ -4,25 +4,25 @@ import torch
 
 from chassis.action_space import ActionSpace
 from chassis.actor_critic import ActorCritic, count_parameters, load_policy_bytes, save_policy_bytes
-from chassis.state_vectorizer import STATE_DIM
+from chassis.state_vectorizer import TRAINING_STATE_DIM
 
 
 class TestActorCriticShapes(unittest.TestCase):
     def test_defaults_match_chassis_constants(self):
         model = ActorCritic()
-        self.assertEqual(model.state_dim, STATE_DIM)
+        self.assertEqual(model.state_dim, TRAINING_STATE_DIM)
         self.assertEqual(model.action_dim, ActionSpace.N)
 
     def test_forward_single_input_shapes(self):
         model = ActorCritic()
-        x = torch.randn(STATE_DIM)
+        x = torch.randn(TRAINING_STATE_DIM)
         logits, value = model(x)
         self.assertEqual(logits.shape, (ActionSpace.N,))
         self.assertEqual(value.shape, (1,))
 
     def test_forward_batched_input_shapes(self):
         model = ActorCritic()
-        x = torch.randn(4, STATE_DIM)
+        x = torch.randn(4, TRAINING_STATE_DIM)
         logits, value = model(x)
         self.assertEqual(logits.shape, (4, ActionSpace.N))
         self.assertEqual(value.shape, (4, 1))
@@ -30,7 +30,7 @@ class TestActorCriticShapes(unittest.TestCase):
     def test_save_load_roundtrip_preserves_output(self):
         model = ActorCritic()
         model.eval()
-        x = torch.randn(STATE_DIM)
+        x = torch.randn(TRAINING_STATE_DIM)
         with torch.no_grad():
             logits_before, value_before = model(x)
 

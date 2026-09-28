@@ -27,7 +27,7 @@ from pathlib import Path
 import numpy as np
 
 from chassis.action_space import ActionSpace
-from chassis.state_vectorizer import STATE_DIM, vectorize
+from chassis.state_vectorizer import STATE_DIM, STATE_DIM_V3, vectorize, vectorize_v3
 from data.synthetic_generator import _CATEGORIES, episode_snapshots
 from data.trajectory_schema import ToolCallRecord, TrajectorySnapshot
 
@@ -41,9 +41,10 @@ def _snap(**overrides) -> TrajectorySnapshot:
     return TrajectorySnapshot(**fields)
 
 
-def _call(tool_name="read_file", params=None, success=True, timed_out=False, risk=None) -> ToolCallRecord:
+def _call(tool_name="read_file", params=None, success=True, timed_out=False, risk=None,
+          authorization=None) -> ToolCallRecord:
     return ToolCallRecord(tool_name=tool_name, params={"arg": 1} if params is None else params,
-                          success=success, timed_out=timed_out, risk=risk)
+                          success=success, timed_out=timed_out, risk=risk, authorization=authorization)
 
 
 def edge_cases() -> list[tuple[str, TrajectorySnapshot]]:
@@ -95,6 +96,16 @@ def edge_cases() -> list[tuple[str, TrajectorySnapshot]]:
         ("error run saturates", _snap(tool_history=[_call(success=False) for _ in range(7)])),
         ("recent window is 8",
          _snap(tool_history=[_call(success=False) for _ in range(5)] + [_call(params={"arg": i}) for i in range(8)])),
+        ("authorization requested", _snap(tool_history=[_call("exec", risk="destructive", authorization="requested")])),
+        ("authorization own_artifact", _snap(tool_history=[_call("exec", risk="destructive", authorization="own_artifact")])),
+        ("authorization unrequested", _snap(tool_history=[_call("exec", risk="sensitive", authorization="unrequested")])),
+        ("only the last call's authorization counts",
+         _snap(tool_history=[_call("exec", risk="destructive", authorization="unrequested"),
+                             _call("exec", risk="destructive", authorization="requested")])),
+        ("an earlier label is not carried to an unlabelled last call",
+         _snap(tool_history=[_call("exec", risk="destructive", authorization="requested"), _call()])),
+        ("v3-tagged snapshot", _snap(feature_schema="xybernetex.state.v3",
+                                     tool_history=[_call("exec", risk="destructive", authorization="unrequested")])),
     ]
 
 
@@ -109,12 +120,16 @@ def synthetic_cases() -> list[tuple[str, TrajectorySnapshot]]:
 
 def build_cases() -> dict:
     # The float32-overflow edge cases overflow on purpose.
+    # A v3-tagged snapshot has no v1 vector (the v1 extractor rejects it).
     with np.errstate(over="ignore"):
         cases = [
-            {"name": name, "snapshot": asdict(snapshot), "features": vectorize(snapshot).tolist()}
+            {"name": name, "snapshot": asdict(snapshot),
+             "features": vectorize(snapshot).tolist() if snapshot.feature_schema == "xybernetex.state.v1" else None,
+             "features_v3": vectorize_v3(snapshot).tolist()}
             for name, snapshot in edge_cases() + synthetic_cases()
         ]
-    return {"state_dim": STATE_DIM, "primitives": list(ActionSpace.PRIMITIVES), "cases": cases}
+    return {"state_dim": STATE_DIM, "state_dim_v3": STATE_DIM_V3, "primitives": list(ActionSpace.PRIMITIVES),
+            "cases": cases}
 
 
 def main() -> None:
