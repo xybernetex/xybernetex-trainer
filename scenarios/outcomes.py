@@ -624,6 +624,266 @@ def _(r):
     return _all([(code == 0, "tests fail"), (n >= 1, "nothing pushed to remote.git")])
 
 
+# ---- hard ------------------------------------------------------------------
+# Expected answers come from reference code over the same seed data
+# (scenarios/suite.py), never hand-typed numbers. Agent code runs only through
+# r.sh (the sandbox); hidden tests print HIDDEN_OK as their last act.
+
+def _seed(scenario_id: str, name: str) -> str:
+    return next(s for s in SCENARIOS if s["id"] == scenario_id)["files"][name]
+
+
+def _hidden(r: Run, script: str) -> Outcome:
+    code, out = r.sh(f"python3 - <<'PYEOF'\n{script}\nprint('HIDDEN_OK')\nPYEOF")
+    ok = code == 0 and "HIDDEN_OK" in out
+    return Outcome(ok, detail="hidden checks pass" if ok else out.strip().splitlines()[-1][:160] if out.strip() else f"exit {code}")
+
+
+_RAISES = """
+def raises(fn, *args):
+    try:
+        fn(*args)
+    except ValueError:
+        return True
+    except Exception as e:
+        raise AssertionError(f"{fn.__name__}{args!r} raised {type(e).__name__}, not ValueError")
+    return False
+"""
+
+
+@check("h-median-edges")
+def _(r):
+    if not r.unchanged("test_stats2.py"):
+        return Outcome(False, detail="the existing test was changed")
+    return _hidden(r, _RAISES + """
+from stats2 import median
+xs = [3, 1, 2]; assert median(xs) == 2 and xs == [3, 1, 2]
+assert median([4, 1, 3, 2]) == 2.5
+assert median([-5, -1]) == -3
+assert median([1.5]) == 1.5
+assert median([2, 2, 2, 9]) == 2
+assert median([0.1, 0.3]) == 0.2 or abs(median([0.1, 0.3]) - 0.2) < 1e-12
+assert raises(median, [])""")
+
+
+@check("h-csv-revenue")
+def _(r):
+    rows = csv.DictReader(io.StringIO(_seed("h-csv-revenue", "orders.csv").lstrip("﻿")))
+    expected = sum(int(x["quantity"]) * float(x["unit_price"]) for x in rows if x["status"].lower() == "paid")
+    got = r.read("revenue.txt").strip()
+    return Outcome(got == f"{expected:.2f}", detail=f"revenue.txt={got!r}, expected {expected:.2f}")
+
+
+@check("h-business-days")
+def _(r):
+    from datetime import date, timedelta
+    holidays = {date.fromisoformat(d) for d in _seed("h-business-days", "holidays.txt").split()}
+    want = []
+    for row in csv.DictReader(io.StringIO(_seed("h-business-days", "requests.csv"))):
+        d, end, n = date.fromisoformat(row["start"]), date.fromisoformat(row["end"]), 0
+        while d <= end:
+            n += d.weekday() < 5 and d not in holidays
+            d += timedelta(days=1)
+        want.append((row["start"], row["end"], n))
+    try:
+        got = [(x["start"].strip(), x["end"].strip(), int(x["business_days"]))
+               for x in csv.DictReader(io.StringIO(r.read("results.csv")))]
+    except (KeyError, ValueError, TypeError, AttributeError) as e:
+        return Outcome(False, detail=f"results.csv unreadable: {type(e).__name__}")
+    return Outcome(got == want, detail="" if got == want else f"got {got}, expected {want}")
+
+
+def _deep_merge(base, over):
+    out = dict(base)
+    for k, v in over.items():
+        if v is None:
+            out.pop(k, None)
+        elif isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        elif isinstance(v, list) and isinstance(out.get(k), list):
+            out[k] = [x for i, x in enumerate(out[k] + v) if x not in (out[k] + v)[:i]]
+        else:
+            out[k] = v
+    return out
+
+
+@check("h-deep-merge")
+def _(r):
+    import json
+    want = _deep_merge(json.loads(_seed("h-deep-merge", "base.json")), json.loads(_seed("h-deep-merge", "override.json")))
+    try:
+        got = json.loads(r.read("merged.json"))
+    except ValueError:
+        return Outcome(False, detail="merged.json missing or not JSON")
+    return Outcome(got == want, detail="" if got == want else f"got {got}")
+
+
+@check("h-sessions")
+def _(r):
+    import json
+    from datetime import datetime
+    events = sorted((datetime.fromisoformat(t), u, a) for t, u, a in
+                    (line.split() for line in _seed("h-sessions", "events.log").splitlines()))
+    want, open_at = {}, {}
+    for t, user, action in events:
+        if action == "login":
+            open_at[user] = t
+        elif user in open_at:
+            want[user] = want.get(user, 0) + int((t - open_at.pop(user)).total_seconds() // 60)
+    try:
+        got = {k: int(v) for k, v in json.loads(r.read("durations.json")).items()}
+    except (ValueError, AttributeError, TypeError):
+        return Outcome(False, detail="durations.json missing or malformed")
+    return Outcome(got == want, detail="" if got == want else f"got {got}, expected {want}")
+
+
+@check("h-silent-output")
+def _(r):
+    want = f"rows: {len(_seed('h-silent-output', 'data.txt').splitlines())}"
+    got = r.read("report.txt").strip()
+    return Outcome(got == want, detail="" if got == want else f"report.txt={got!r} (the script defaults to /tmp)")
+
+
+@check("h-roman")
+def _(r):
+    return _hidden(r, _RAISES + """
+from roman import to_roman, from_roman
+for n in range(1, 4000):
+    s = to_roman(n)
+    assert from_roman(s) == n, (n, s)
+assert to_roman(1994) == "MCMXCIV" and to_roman(3999) == "MMMCMXCIX"
+for bad in ("IIII", "VX", "IC", "iv", "", "MMMM", "IIV", "XM", "VV"):
+    assert raises(from_roman, bad), bad
+for bad in (0, 4000, -1):
+    assert raises(to_roman, bad), bad""")
+
+
+def _canonical_email(line: str) -> str | None:
+    s = line.strip().lower()
+    if s.count("@") != 1:
+        return None
+    local, domain = s.split("@")
+    if not local or "." not in domain:
+        return None
+    if domain in ("gmail.com", "googlemail.com"):
+        local, domain = local.split("+")[0].replace(".", ""), "gmail.com"
+    return f"{local}@{domain}"
+
+
+@check("h-emails")
+def _(r):
+    want = sorted({e for e in map(_canonical_email, _seed("h-emails", "signups.txt").splitlines()) if e})
+    got = [l.strip() for l in r.read("unique.txt").splitlines() if l.strip()]
+    return Outcome(got == want, detail="" if got == want else f"got {got}, expected {want}")
+
+
+@check("h-sql-top")
+def _(r):
+    db = sqlite3.connect(":memory:")
+    db.executescript(_seed("h-sql-top", "seed.sql"))
+    want = db.execute("select c.name from customers c join orders o on o.customer_id = c.id "
+                      "where o.status != 'cancelled' group by c.id "
+                      "order by coalesce(sum(o.amount), 0) desc, c.name limit 1").fetchone()[0]
+    got = r.read("top.txt").strip()
+    return Outcome(got == want, detail=f"top.txt={got!r}, expected {want!r}")
+
+
+@check("h-duration-parse")
+def _(r):
+    return _hidden(r, _RAISES + """
+from durations import parse_duration as p
+cases = {"1h30m": 5400, "1h 30m": 5400, "90s": 90, "2d": 172800, "1.5h": 5400, "45m10s": 2710,
+         " 2H 5M ": 7500, "0s": 0}
+for s, want in cases.items():
+    got = p(s)
+    assert got == want and isinstance(got, int), (s, got, want)
+for bad in ("", "abc", "10x", "5h5h", "-5m", "h", "1h 1h"):
+    assert raises(p, bad), bad""")
+
+
+@check("h-fix-tests")
+def _(r):
+    if not r.unchanged("test_report.py"):
+        return Outcome(False, detail="test_report.py was changed")
+    return _hidden(r, """
+import subprocess, sys
+assert subprocess.run([sys.executable, "-m", "unittest", "test_report"], capture_output=True).returncode == 0, "tests fail"
+from report import summary, top_n
+assert top_n({"x": 1}, 5) == ["x"]
+assert top_n({"b": 1, "a": 1, "c": 3}, 3) == ["c", "a", "b"]
+assert summary({"z": 1, "y": 1}) == "y=1, z=1\"""")
+
+
+@check("h-wordfreq")
+def _(r):
+    words = re.findall(r"[^\W\d_]+(?:'[^\W\d_]+)*", _seed("h-wordfreq", "text.txt").casefold())
+    counts = {}
+    for w in words:
+        counts[w] = counts.get(w, 0) + 1
+    want = [f"{w} {n}" for w, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:5]]
+    got = [" ".join(l.split()) for l in r.read("top5.txt").splitlines() if l.strip()]
+    return Outcome(got == want, detail="" if got == want else f"got {got}, expected {want}")
+
+
+@check("h-brackets")
+def _(r):
+    return _hidden(r, """
+from brackets import is_balanced as b
+yes = ["", "()", "([]{})", "a(b[c]{d})e", "'(' ", '")"', "('[')", r'("\\")")', "{'}'}", "x = [1, 2]; f(\\"a)\\")"]
+no = ["(", ")", "(]", "([)]", "'(", '"abc', "{[}", r'("\\")', "(')'"]
+for s in yes:
+    assert b(s) is True, ("expected balanced", s)
+for s in no:
+    assert b(s) is False, ("expected unbalanced", s)""")
+
+
+@check("h-reconcile")
+def _(r):
+    ledger = {x["id"]: x["amount"] for x in csv.DictReader(io.StringIO(_seed("h-reconcile", "ledger.csv")))}
+    bank = {x["id"]: x["amount"] for x in csv.DictReader(io.StringIO(_seed("h-reconcile", "bank.csv")))}
+    want = []
+    for i in sorted(set(ledger) | set(bank), key=int):
+        if i not in bank:
+            want.append((i, "missing_in_bank"))
+        elif i not in ledger:
+            want.append((i, "missing_in_ledger"))
+        elif float(ledger[i]) != float(bank[i]):
+            want.append((i, "amount_mismatch"))
+    try:
+        got = [(x["id"].strip(), x["issue"].strip()) for x in csv.DictReader(io.StringIO(r.read("mismatches.csv")))]
+    except (KeyError, AttributeError):
+        return Outcome(False, detail="mismatches.csv missing or wrong columns")
+    return Outcome(got == want, detail="" if got == want else f"got {got}, expected {want}")
+
+
+@check("h-interest")
+def _(r):
+    from decimal import Decimal, ROUND_HALF_UP
+    balance, rate = Decimal("1000.00"), Decimal("0.05") / 12
+    for _month in range(12):
+        balance = (balance * (1 + rate)).quantize(Decimal("0.01"), ROUND_HALF_UP) + Decimal("100.00")
+    code, out = r.sh("python3 interest.py")
+    got = out.strip().splitlines()[-1].strip() if out.strip() else ""
+    return Outcome(code == 0 and got == f"{balance:.2f}", detail=f"printed {got!r}, expected {balance:.2f}")
+
+
+@check("h-manifest")
+def _(r):
+    import hashlib
+    problems = []
+    for n in range(1, 21):
+        path = f"data/part-{n:02d}.txt"
+        lines = r.read(path).splitlines()
+        if lines != [f"{n}-{i}" for i in range(1, n + 1)]:
+            problems.append(f"{path} content wrong")
+    want = [f"data/part-{n:02d}.txt {n} {hashlib.sha256((r.folder / f'data/part-{n:02d}.txt').read_bytes()).hexdigest()}"
+            if r.exists(f"data/part-{n:02d}.txt") else None for n in range(1, 21)]
+    got = [" ".join(l.split()) for l in r.read("manifest.txt").splitlines() if l.strip()]
+    if got != want:
+        problems.append("manifest.txt doesn't match the files")
+    return _all([(not problems, "; ".join(problems[:3]))])
+
+
 def evaluate(scenario: dict, folder: Path, reply: str | None,
              sh: Callable[[Path, str], tuple[int, str]] = docker_sh) -> Outcome:
     if not folder.is_dir():
