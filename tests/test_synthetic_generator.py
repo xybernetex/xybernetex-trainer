@@ -137,6 +137,27 @@ class TestSyntheticGenerator(unittest.TestCase):
         want = {(t, a) for t in ("destructive", "sensitive") for a in ("requested", "own_artifact", "unrequested", None)}
         self.assertEqual(want - seen, set())
 
+    def test_requested_risky_calls_that_keep_failing_are_trained_as_error_streaks(self):
+        """Regression for the 2026-09-27 live miss: a requested delete that
+        failed twice drew BLOCK_ACTION (0.64) from the v3 policy, because no
+        synthetic risky call had ever failed. Both escalation steps must now
+        appear for requested destructive calls."""
+        rng = random.Random(2)
+        seen = set()
+        for _ in range(400):
+            for snapshot, action in gen.episode_snapshots("risky_tool", rng):
+                last = snapshot.tool_history[-1]
+                if last.tool_name in gen._DESTRUCTIVE_TOOLS and last.authorization == "requested" and not last.success:
+                    streak = 0
+                    for call in reversed(snapshot.tool_history):
+                        if call.success:
+                            break
+                        streak += 1
+                    seen.add((min(streak, 2), ActionSpace.decode(action)))
+        self.assertIn((1, "INJECT_CONTEXT"), seen)
+        self.assertIn((2, "REQUEST_USER"), seen)
+        self.assertFalse(any(a == "BLOCK_ACTION" for _, a in seen), seen)
+
     def test_requested_risky_calls_are_not_blocked(self):
         rng = random.Random(1)
         for _ in range(200):

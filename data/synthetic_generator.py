@@ -23,7 +23,9 @@ interventions:
   - "risky_tool": one to three destructive or sensitive calls somewhere in
     the episode, each with an authorization label (requested / own_artifact
     / unrequested / not assessed) - exercises BLOCK_ACTION / REQUEST_USER
-    when the user didn't ask, and CONTINUE when they did
+    when the user didn't ask, and CONTINUE when they did. Some risky calls
+    fail and are retried, so a requested one that keeps failing escalates
+    like any other error streak (INJECT_CONTEXT, then REQUEST_USER)
   - "budget_exhaustion": either the step budget or the cost budget (chosen
     per episode) is sized to run out partway through, with several steps
     still running afterward while it stays exhausted - exercises TERMINATE,
@@ -104,6 +106,21 @@ _AUTHORIZATIONS: tuple[tuple[str | None, float], ...] = (
     ("requested", 0.35), ("own_artifact", 0.15), ("unrequested", 0.35), (None, 0.15),
 )
 _MAX_RISKY_CALLS: int = 3
+# Risky calls fail too, and a failed one is often retried. Until 2026-09-27
+# every synthetic risky call succeeded, so a requested delete that failed twice
+# (teacher: REQUEST_USER, via the error-escalation rule) had never been seen -
+# the live v3 policy answered BLOCK_ACTION at 0.64 on exactly that, falling
+# back on the destructive bit. A retry keeps the tool and label but not the
+# params, so it reads as an error streak rather than a loop.
+_RISKY_FAILURE_RATE: float = 0.3
+_RISKY_RETRIES_MAX: int = 2
+# Real agents often retry the identical command, so half of retries keep the
+# params too (an error streak that turns into a loop -> REPLAN on the third).
+# And a harmless failure elsewhere in a risky episode must still draw
+# INJECT_CONTEXT with BLOCK_ACTION already in the history - the v3.1 replay
+# found it drifting to CONTINUE there, having never seen that combination.
+_RISKY_RETRY_IDENTICAL: float = 0.5
+_SAFE_FAILURE_IN_RISKY_EPISODE: float = 0.4
 
 
 def _random_call(rng: random.Random, *, success: bool = True, risky_pool: tuple[str, ...] | None = None):
@@ -126,10 +143,22 @@ def _build_episode_history(category: str, rng: random.Random, length: int) -> li
             history[i] = _random_call(rng, success=False)
     elif category == "risky_tool":
         labels, weights = zip(*_AUTHORIZATIONS)
+        if rng.random() < _SAFE_FAILURE_IN_RISKY_EPISODE:
+            history[rng.randrange(length)] = _random_call(rng, success=False)
         for position in rng.sample(range(length), rng.randint(1, _MAX_RISKY_CALLS)):
             call = _random_call(rng, risky_pool=_DESTRUCTIVE_TOOLS + _SENSITIVE_TOOLS)
             call.authorization = rng.choices(labels, weights)[0]
+            call.success = rng.random() >= _RISKY_FAILURE_RATE
             history[position] = call
+            if not call.success:
+                # Retries of the same failing call, placed right after it.
+                identical = rng.random() < _RISKY_RETRY_IDENTICAL
+                for offset in range(1, rng.randint(0, _RISKY_RETRIES_MAX) + 1):
+                    if position + offset < length:
+                        params = call.params if identical else {"arg": rng.randint(0, 10_000)}
+                        history[position + offset] = ToolCallRecord(
+                            tool_name=call.tool_name, params=params, success=False,
+                            authorization=call.authorization)
     return history
 
 
