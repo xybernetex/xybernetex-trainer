@@ -70,6 +70,24 @@ FRAMING = (
     "reasonable assumptions and finish the task.\n\nTask: {prompt}"
 )
 
+# Follow-up turns the control plane can send, in the same session, after the
+# agent says it's done. A new turn rather than OpenClaw's before_agent_finalize
+# revision: OpenClaw declines that revision once a run has had side effects
+# (any file write or exec), which every coding task has - 22 of 22 declined in
+# the first verify batch.
+FOLLOW_UPS = {
+    "verify": (
+        "Before I accept this, check your work against the original request:\n"
+        "1. Re-read the request and confirm every part of it is done.\n"
+        "2. For each file you created or changed, confirm it exists at the requested path with the expected "
+        "content.\n"
+        "3. If you reported a command's output or test results, re-run it and make sure your answer matches what "
+        "it actually prints.\n"
+        "4. Check the edge cases and exact formats the request mentions.\n"
+        "If anything is missing or wrong, fix it now. Then give your final answer again in full."
+    ),
+}
+
 
 def _openclaw_cmd() -> list[str]:
     """Invoke OpenClaw's entry script with node directly - avoids Windows
@@ -170,7 +188,7 @@ def _reply_text(stdout: str) -> str | None:
     return "\n\n".join(texts)[-4000:] or None
 
 
-def _run_job(job: dict, scenario: dict, oc: list[str], timeout: int) -> dict:
+def _run_job(job: dict, scenario: dict, oc: list[str], timeout: int, follow_up: str | None = None) -> dict:
     """Never raises: an unhandled exception here used to propagate through
     future.result() in run()'s main loop and crash the whole batch, throwing
     away every other job still in flight or already completed this pass -
@@ -178,7 +196,7 @@ def _run_job(job: dict, scenario: dict, oc: list[str], timeout: int) -> dict:
     git scenario (see _clear_readonly_and_retry) took down 557 queued jobs."""
     started = time.time()
     try:
-        return _run_job_unsafe(job, scenario, oc, timeout)
+        return _run_job_unsafe(job, scenario, oc, timeout, follow_up)
     except Exception as exc:  # noqa: BLE001 - genuinely must not propagate, see above
         return {**job, "status": "crashed", "exit_code": None,
                 "started": datetime.fromtimestamp(started, timezone.utc).isoformat(),
@@ -186,14 +204,12 @@ def _run_job(job: dict, scenario: dict, oc: list[str], timeout: int) -> dict:
                 "stderr_tail": f"{type(exc).__name__}: {exc}"[-1500:]}
 
 
-def _run_job_unsafe(job: dict, scenario: dict, oc: list[str], timeout: int) -> dict:
-    _seed_folder(job, scenario)
-    message = FRAMING.format(folder=job["folder"], prompt=scenario["prompt"])
+def _agent_turn(job: dict, oc: list[str], timeout: int, message: str) -> tuple[str, int | None, str, str]:
+    """One `openclaw agent` turn in the job's session: (status, exit code, stdout, stderr)."""
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
         f.write(message)
         message_file = f.name
     model_id = MODELS[job["model"]][0]
-    started = time.time()
     try:
         proc = subprocess.run(
             [*oc, "agent", "--agent", AGENT_ID, "--session-key", job["session_key"],
@@ -201,24 +217,38 @@ def _run_job_unsafe(job: dict, scenario: dict, oc: list[str], timeout: int) -> d
              "--json"],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout + 180,
         )
-        status = "done" if proc.returncode == 0 else "failed"
-        out, err, code = proc.stdout, proc.stderr, proc.returncode
+        return ("done" if proc.returncode == 0 else "failed"), proc.returncode, proc.stdout, proc.stderr
     except subprocess.TimeoutExpired as e:
-        status, code = "timeout", None
         out = (e.stdout or b"").decode("utf-8", "replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
-        err = ""
+        return "timeout", None, out, ""
     finally:
         Path(message_file).unlink(missing_ok=True)
-    return {
+
+
+def _run_job_unsafe(job: dict, scenario: dict, oc: list[str], timeout: int, follow_up: str | None = None) -> dict:
+    _seed_folder(job, scenario)
+    started = time.time()
+    status, code, out, err = _agent_turn(job, oc, timeout, FRAMING.format(folder=job["folder"],
+                                                                         prompt=scenario["prompt"]))
+    result = {
         **job,
         "status": status,
         "exit_code": code,
         "started": datetime.fromtimestamp(started, timezone.utc).isoformat(),
-        "seconds": round(time.time() - started, 1),
         "reply": _reply_text(out),
         "stdout_tail": out[-3000:],
         "stderr_tail": err[-1500:],
     }
+    # Only a finished run gets the follow-up. The run's status stays the
+    # first turn's: its work is on disk whether or not the follow-up turn
+    # survives, and grading judges the folder as the follow-up left it.
+    if follow_up and status == "done":
+        f_status, f_code, f_out, f_err = _agent_turn(job, oc, timeout, FOLLOW_UPS[follow_up])
+        result.update({"follow_up": follow_up, "follow_up_status": f_status, "first_reply": result["reply"],
+                       "follow_up_stdout_tail": f_out[-3000:], "follow_up_stderr_tail": f_err[-1500:]})
+        result["reply"] = _reply_text(f_out) or result["reply"]
+    result["seconds"] = round(time.time() - started, 1)
+    return result
 
 
 def run(args) -> None:
@@ -238,6 +268,7 @@ def run(args) -> None:
         meta_path.write_text(json.dumps({
             "batch": args.batch, "created": datetime.now(timezone.utc).isoformat(),
             "models": args.models, "reps": args.reps, "only": args.only, "category": args.category,
+            "follow_up": args.follow_up,
         }, indent=1), encoding="utf-8")
     print(f"{len(jobs)} runs to go ({len(done)} already in the manifest)")
     if args.dry_run:
@@ -251,7 +282,8 @@ def run(args) -> None:
     counts: Counter = Counter()
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
-        futures = {pool.submit(_run_job, j, scenarios[j["scenario"]], oc, args.timeout): j for j in jobs}
+        futures = {pool.submit(_run_job, j, scenarios[j["scenario"]], oc, args.timeout, args.follow_up): j
+                   for j in jobs}
         for i, future in enumerate(as_completed(futures), 1):
             result = future.result()
             with lock:
@@ -275,6 +307,8 @@ def main() -> None:
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--timeout", type=int, default=600, help="per-run agent timeout, seconds")
     parser.add_argument("--retry-failed", action="store_true", help="re-run jobs whose last status wasn't done")
+    parser.add_argument("--follow-up", choices=sorted(FOLLOW_UPS),
+                        help="send this follow-up turn, in the same session, after every run that finishes")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     if args.setup:
