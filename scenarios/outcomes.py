@@ -891,6 +891,174 @@ def _(r):
     return _all([(not problems, "; ".join(problems[:3]))])
 
 
+# ---- hard2 -------------------------------------------------------------------
+from scenarios import hard2 as H2  # noqa: E402
+
+
+@check("hh-kv-cli")
+def _(r):
+    return _hidden(r, """
+import json, os, shutil, subprocess, sys, tempfile
+d = tempfile.mkdtemp(); shutil.copy("kv.py", d); os.chdir(d)
+def kv(*args):
+    p = subprocess.run([sys.executable, "kv.py", *args], capture_output=True, text=True)
+    return p.returncode, p.stdout, p.stderr
+assert kv("list") == (0, "", ""), kv("list")
+assert kv("set", "b.key", "two words")[0] == 0 and kv("set", "a_1", "x")[0] == 0
+code, out, err = kv("get", "b.key"); assert (code, out.strip()) == (0, "two words"), (code, out)
+assert kv("set", "a_1", "y")[0] == 0
+code, out, _ = kv("list"); assert out.splitlines() == ["a_1=y", "b.key=two words"], out
+code, out, _ = kv("list", "--json"); assert json.loads(out) == {"a_1": "y", "b.key": "two words"} and out.strip().index('"a_1"') < out.strip().index('"b.key"'), out
+code, out, err = kv("get", "nope"); assert code == 1 and err.strip() == "error: no such key: nope" and not out, (code, out, err)
+code, out, err = kv("delete", "nope"); assert code == 1 and err.strip() == "error: no such key: nope", (code, err)
+assert kv("delete", "a_1")[:2] == (0, "")
+code, out, _ = kv("get", "a_1"); assert code == 1
+code, out, err = kv("set", "bad key!", "v"); assert code == 2 and err.strip() == "error: invalid key: bad key!", (code, err)
+code, out, err = kv("get", "bad/key"); assert code == 2 and "invalid key" in err, (code, err)
+for bad in ([], ["frobnicate"], ["set", "k"], ["get"]):
+    code, out, err = kv(*bad); assert code == 2 and err.strip(), (bad, code, err)
+assert json.load(open("store.json")) == {"b.key": "two words"}""")
+
+
+@check("hh-cart-spec")
+def _(r):
+    if not r.unchanged("test_cart.py"):
+        return Outcome(False, detail="test_cart.py was changed")
+    return _hidden(r, _RAISES + """
+from cart import add_item, remove_item, total
+c = {}
+add_item(c, "a", 2, 250); add_item(c, "a", 1, 999)
+assert c["a"] == {"qty": 3, "price_cents": 250}, c
+for bad in (0, -1):
+    assert raises(add_item, c, "b", bad, 100)
+assert raises(remove_item, c, "a", 4) and c["a"]["qty"] == 3
+assert raises(remove_item, c, "zzz")
+remove_item(c, "a", 3); assert "a" not in c, c
+add_item(c, "x", 1, 1005)
+assert total(c, "SAVE10") == 905, total(c, "SAVE10")
+add_item(c, "y", 9, 100)
+assert total(c) == 1905 and total(c, "BULK") == 1810, (total(c), total(c, "BULK"))
+remove_item(c, "y", 1)
+assert total(c, "BULK") == 1805, total(c, "BULK")
+assert raises(total, c, "FREE")
+remove_item(c, "x"); assert "x" not in c""")
+
+
+@check("hh-log-hourly")
+def _(r):
+    import json
+    want = H2.ref_errors_by_hour(H2.LOG_HOURLY)
+    try:
+        got = {k: int(v) for k, v in json.loads(r.read("errors_by_hour.json")).items()}
+    except (ValueError, AttributeError, TypeError):
+        return Outcome(False, detail="errors_by_hour.json missing or malformed")
+    if got == want:
+        return Outcome(True)
+    diff = sorted(k for k in set(got) | set(want) if got.get(k) != want.get(k))
+    return Outcome(False, detail=f"{len(diff)} hours differ, e.g. {diff[:2]}: got {[got.get(k) for k in diff[:2]]} "
+                                 f"expected {[want.get(k) for k in diff[:2]]}")
+
+
+@check("hh-toposort")
+def _(r):
+    checks = []
+    for name, text in (("a", H2.TASKS_A), ("b", H2.TASKS_B)):
+        order = H2.ref_toposort(text)
+        want = ["cycle detected"] if order is None else order
+        got = [l.strip() for l in r.read(f"order_{name}.txt").splitlines() if l.strip()]
+        checks.append((got == want, f"order_{name}.txt: got {got}, expected {want}"))
+    return _all(checks)
+
+
+@check("hh-bill-split")
+def _(r):
+    balances, transfers = H2.ref_bill_split(H2.EXPENSES)
+    try:
+        got_bal = {x["name"].strip(): int(x["net_cents"]) for x in csv.DictReader(io.StringIO(r.read("balances.csv")))}
+    except (KeyError, ValueError, AttributeError):
+        got_bal = None
+    want_tr = [f"{a} pays {b} {n}" for a, b, n in transfers]
+    got_tr = [" ".join(l.split()) for l in r.read("settlements.txt").splitlines() if l.strip()]
+    return _all([(got_bal == balances, f"balances {got_bal} != {balances}"),
+                 (got_tr == want_tr, f"settlements {got_tr} != {want_tr}")])
+
+
+@check("hh-paged-fetch")
+def _(r):
+    import json
+    try:
+        got = json.loads(r.read("items.json"))
+    except ValueError:
+        return Outcome(False, detail="items.json missing or not JSON")
+    want = H2.ref_paged_items()
+    return Outcome(got == want, detail="" if got == want else f"{len(got) if isinstance(got, list) else '?'} items; "
+                                                            f"expected {len(want)}")
+
+
+@check("hh-migration")
+def _(r):
+    if not r.exists("migrate.sql"):
+        return Outcome(False, detail="migrate.sql missing")
+    want = H2.ref_migration_rows(H2.SEED_V1)
+    code, out = r.sh("rm -f /tmp/m.db && sqlite3 /tmp/m.db < seed_v1.sql && sqlite3 /tmp/m.db < migrate.sql && "
+                     "sqlite3 -json /tmp/m.db \"select id, first_name, last_name, phone from people order by id\" && "
+                     "echo ---SCHEMA && sqlite3 -json /tmp/m.db \"select name, [notnull], pk from pragma_table_info('people')\"")
+    if code != 0 or "---SCHEMA" not in out:
+        return Outcome(False, detail=f"migration failed: {out.strip()[-160:]}")
+    import json
+    rows_json, schema_json = out.split("---SCHEMA")
+    rows = [tuple(x.values()) for x in json.loads(rows_json.strip() or "[]")]
+    schema = {x["name"]: (x["notnull"], x["pk"]) for x in json.loads(schema_json.strip() or "[]")}
+    return _all([(rows == want, f"rows {rows} != {want}"),
+                 (list(schema) == ["id", "first_name", "last_name", "phone"], f"columns {list(schema)}"),
+                 (schema.get("first_name", (0,))[0] == 1 and schema.get("last_name", (0,))[0] == 1, "names not NOT NULL"),
+                 (schema.get("id", (0, 0))[1] == 1, "id not the primary key")])
+
+
+@check("hh-net-revenue")
+def _(r):
+    want = H2.ref_net_revenue()
+    try:
+        got = [(x["month"].strip(), x["region"].strip(), x["net_usd"].strip())
+               for x in csv.DictReader(io.StringIO(r.read("report.csv")))]
+    except (KeyError, AttributeError):
+        return Outcome(False, detail="report.csv missing or wrong columns")
+    return Outcome(got == want, detail="" if got == want else f"got {got}, expected {want}")
+
+
+@check("hh-recurrence")
+def _(r):
+    want = H2.ref_recurrence()
+    got = [l.strip() for l in r.read("dates.txt").splitlines() if l.strip()]
+    return Outcome(got == want, detail="" if got == want else f"missing {sorted(set(want) - set(got))}, "
+                                                            f"extra {sorted(set(got) - set(want))}")
+
+
+_WRAP_CASES = [
+    ("The quick brown fox jumps over the lazy dog", 10),
+    ("a  b   c\n\n\n\nd e", 3),
+    ("supercalifragilistic is long", 6),
+    ("  leading and trailing  \n\n  ", 7),
+    ("x " * 5 + "\n" + "yyyyyyyyyy z", 4),
+    ("exact fits", 5),
+    ("", 5),
+    ("one\ntwo\nthree", 20),
+]
+
+
+@check("hh-wrap")
+def _(r):
+    import json
+    cases = json.dumps([[t, w, H2.ref_wrap(t, w)] for t, w in _WRAP_CASES])
+    return _hidden(r, _RAISES + f"""
+import json
+from wrap import wrap
+for text, width, want in json.loads({cases!r}):
+    got = wrap(text, width)
+    assert got == want, (text, width, got, want)
+assert raises(wrap, "a b", 0)""")
+
+
 def evaluate(scenario: dict, folder: Path, reply: str | None,
              sh: Callable[[Path, str], tuple[int, str]] = docker_sh) -> Outcome:
     if not folder.is_dir():
