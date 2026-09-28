@@ -1,6 +1,7 @@
 import random
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -8,6 +9,7 @@ import numpy as np
 from chassis.action_space import ActionSpace
 from chassis.state_vectorizer import TRAINING_STATE_DIM
 from data import synthetic_generator as gen
+from teacher.heuristic_teacher import select_action
 
 TERMINATE = ActionSpace.encode("TERMINATE")
 
@@ -157,6 +159,22 @@ class TestSyntheticGenerator(unittest.TestCase):
         self.assertIn((1, "INJECT_CONTEXT"), seen)
         self.assertIn((2, "REQUEST_USER"), seen)
         self.assertFalse(any(a == "BLOCK_ACTION" for _, a in seen), seen)
+
+    def test_some_episodes_have_decisions_missing_from_the_history(self):
+        """A failed Worker call records its tool call but not its decision, so
+        live recent_actions can lag tool_history; training must include that,
+        with the teacher's labels untouched (it never reads recent_actions)."""
+        rng = random.Random(3)
+        lagging = empty_midway = 0
+        for _ in range(200):
+            for snapshot, action in gen.episode_snapshots("error_recovery", rng):
+                missing = (snapshot.step_number - 1) - len(snapshot.recent_actions)
+                lagging += missing > 0
+                empty_midway += snapshot.step_number >= 5 and not snapshot.recent_actions
+                full = replace(snapshot, recent_actions=[])
+                self.assertEqual(action, select_action(full))
+        self.assertGreater(lagging, 0)
+        self.assertGreater(empty_midway, 0)
 
     def test_requested_risky_calls_are_not_blocked(self):
         rng = random.Random(1)

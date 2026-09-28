@@ -121,6 +121,17 @@ _RISKY_RETRIES_MAX: int = 2
 # found it drifting to CONTINUE there, having never seen that combination.
 _RISKY_RETRY_IDENTICAL: float = 0.5
 _SAFE_FAILURE_IN_RISKY_EPISODE: float = 0.4
+# The live action history isn't always complete: a Worker call that fails or
+# times out records its tool call but never adds a decision (supervisor.js),
+# so recent_actions can lag tool_history - by a lot during an outage. (A
+# plugin reload or eviction resets both together, so it doesn't cause this.)
+# A model that has only seen perfect histories under-escalates on a partial
+# one: with its own INJECT_CONTEXT missing, a failure streak drew
+# INJECT_CONTEXT instead of REQUEST_USER in probing. So a few decisions go
+# missing, and some episodes lose every decision before a random step (an
+# outage that ended partway through).
+_JOIN_LATE_RATE: float = 0.2
+_DROPPED_DECISION_RATE: float = 0.05
 
 
 def _random_call(rng: random.Random, *, success: bool = True, risky_pool: tuple[str, ...] | None = None):
@@ -216,6 +227,10 @@ def episode_snapshots(category: str, rng: random.Random) -> list[tuple[Trajector
     length = rng.randint(_MIN_EPISODE_LENGTH, _MAX_EPISODE_LENGTH)
     max_steps, cost_per_step, cost_budget = _episode_budgets(category, rng, length)
     history = _build_episode_history(category, rng, length)
+    # Decisions made before this step never reach the history (an outage
+    # that ended partway - see _JOIN_LATE_RATE). Labels are unaffected: the
+    # teacher never reads recent_actions.
+    join_step = rng.randint(2, length) if rng.random() < _JOIN_LATE_RATE else 1
 
     steps: list[tuple[TrajectorySnapshot, int]] = []
     recent_action_names: list[str] = []
@@ -232,7 +247,8 @@ def episode_snapshots(category: str, rng: random.Random) -> list[tuple[Trajector
         )
         action_index = select_action(snapshot)
         steps.append((snapshot, action_index))
-        recent_action_names.append(ActionSpace.decode(action_index))
+        if step >= join_step and rng.random() >= _DROPPED_DECISION_RATE:
+            recent_action_names.append(ActionSpace.decode(action_index))
     return steps
 
 
