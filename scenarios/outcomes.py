@@ -653,7 +653,11 @@ def raises(fn, *args):
 
 @check("h-median-edges")
 def _(r):
-    if not r.unchanged("test_stats2.py"):
+    # The prompt allows adding tests, so the file may grow; the original test
+    # must survive verbatim. (A first version required the whole file
+    # unchanged and failed 12 agents for doing what they were told.)
+    original = "    def test_odd(self):\n        self.assertEqual(median([3, 1, 2]), 2)\n"
+    if original not in r.read("test_stats2.py").replace("\r\n", "\n"):
         return Outcome(False, detail="the existing test was changed")
     return _hidden(r, _RAISES + """
 from stats2 import median
@@ -870,11 +874,14 @@ def _(r):
 @check("h-manifest")
 def _(r):
     import hashlib
+    # "line i reads 'N-i'" is ambiguous: the literal text "3-1", or N minus i
+    # ("2"). 11 of 12 baseline agents read it as subtraction, so either
+    # reading counts, as long as each file is consistent with one of them.
     problems = []
     for n in range(1, 21):
         path = f"data/part-{n:02d}.txt"
         lines = r.read(path).splitlines()
-        if lines != [f"{n}-{i}" for i in range(1, n + 1)]:
+        if lines not in ([f"{n}-{i}" for i in range(1, n + 1)], [str(n - i) for i in range(1, n + 1)]):
             problems.append(f"{path} content wrong")
     want = [f"data/part-{n:02d}.txt {n} {hashlib.sha256((r.folder / f'data/part-{n:02d}.txt').read_bytes()).hexdigest()}"
             if r.exists(f"data/part-{n:02d}.txt") else None for n in range(1, 21)]

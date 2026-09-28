@@ -152,7 +152,23 @@ ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
 print("wordfreq ranking (check by hand):", ranked[:8])
 GOOD["h-wordfreq"] = {"top5.txt": "".join(f"{w} {n}\n" for w, n in ranked[:5])}
 
+# Extra cases from checker bugs the baseline exposed (2026-09-28).
+EXTRA = [
+    ("h-median-edges", True, {**GOOD["h-median-edges"], "test_stats2.py": seed("h-median-edges", "test_stats2.py")
+                              .replace("if __name__", "    def test_even(self):\n        self.assertEqual(median([1, 2]), 1.5)\n\n\nif __name__")}),
+    ("h-median-edges", False, {**GOOD["h-median-edges"], "test_stats2.py": seed("h-median-edges", "test_stats2.py")
+                               .replace("median([3, 1, 2]), 2", "median([3, 1, 2]), 2.0")}),
+    ("h-manifest", True, (lambda f: {**f, "manifest.txt": "".join(
+        f"{p} {c.count(chr(10))} {hashlib.sha256(c.encode()).hexdigest()}\n" for p, c in f.items())})(
+        {f"data/part-{n:02d}.txt": "".join(f"{n - i}\n" for i in range(1, n + 1)) for n in range(1, 21)})),
+]
+
 fails = 0
+for sid, want, files in EXTRA:
+    got = run(sid, files)
+    ok = got.task is want
+    fails += not ok
+    print(f"{'OK ' if ok else 'BAD'} {sid:18s} extra case expects {want}: got {got.task} ({got.detail[:60]})")
 for sid in [s for s in S if s.startswith("h-")]:
     good, bad = run(sid, GOOD[sid]), run(sid, BAD[sid])
     ok = good.task is True and bad.task is False
