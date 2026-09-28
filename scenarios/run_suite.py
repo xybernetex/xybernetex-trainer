@@ -188,7 +188,8 @@ def _reply_text(stdout: str) -> str | None:
     return "\n\n".join(texts)[-4000:] or None
 
 
-def _run_job(job: dict, scenario: dict, oc: list[str], timeout: int, follow_up: str | None = None) -> dict:
+def _run_job(job: dict, scenario: dict, oc: list[str], timeout: int, follow_up: str | None = None,
+             await_interventions: bool = False) -> dict:
     """Never raises: an unhandled exception here used to propagate through
     future.result() in run()'s main loop and crash the whole batch, throwing
     away every other job still in flight or already completed this pass -
@@ -196,7 +197,7 @@ def _run_job(job: dict, scenario: dict, oc: list[str], timeout: int, follow_up: 
     git scenario (see _clear_readonly_and_retry) took down 557 queued jobs."""
     started = time.time()
     try:
-        return _run_job_unsafe(job, scenario, oc, timeout, follow_up)
+        return _run_job_unsafe(job, scenario, oc, timeout, follow_up, await_interventions)
     except Exception as exc:  # noqa: BLE001 - genuinely must not propagate, see above
         return {**job, "status": "crashed", "exit_code": None,
                 "started": datetime.fromtimestamp(started, timezone.utc).isoformat(),
@@ -225,9 +226,73 @@ def _agent_turn(job: dict, oc: list[str], timeout: int, message: str) -> tuple[s
         Path(message_file).unlink(missing_ok=True)
 
 
-def _run_job_unsafe(job: dict, scenario: dict, oc: list[str], timeout: int, follow_up: str | None = None) -> dict:
+PLUGIN_LOG = Path.home() / ".openclaw" / "xybernetex-supervisor.jsonl"
+
+
+def _log_size() -> int:
+    try:
+        return PLUGIN_LOG.stat().st_size
+    except OSError:
+        return 0
+
+
+def _intervention_lines(session_key: str, offset: int) -> list[dict]:
+    """The plugin's intervention log lines for one session, from byte offset on."""
+    try:
+        with open(PLUGIN_LOG, "rb") as f:
+            f.seek(offset)
+            chunk = f.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    out = []
+    for line in chunk.splitlines():
+        if '"intervention"' not in line or session_key not in line:
+            continue
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue  # a line still being written
+        if e.get("type") == "intervention" and e.get("sessionKey") == session_key:
+            out.append(e)
+    return out
+
+
+def _await_intervention(session_key: str, offset: int, timeout: int, decision_wait: int = 30) -> dict:
+    """Follow-ups now run inside the gateway (the plugin starts them after the
+    turn the harness waited on), so wait for this session's decision and, if
+    a follow-up started, for its outcome - grading must see the folder as the
+    follow-up left it."""
+    t0 = time.time()
+    decision = None
+    while time.time() - t0 < decision_wait:
+        lines = _intervention_lines(session_key, offset)
+        decision = next((e for e in lines if e.get("action") != "outcome"), None)
+        if decision:
+            break
+        time.sleep(2)
+    if not decision:
+        return {"action": None, "note": "no decision logged"}
+    result = {k: decision.get(k) for k in ("action", "probability", "rule", "policy", "scheduled", "mode", "model")}
+    if not decision.get("scheduled"):
+        return result
+    t1 = time.time()
+    while time.time() - t1 < timeout + 60:
+        outcome = next((e for e in _intervention_lines(session_key, offset) if e.get("action") == "outcome"), None)
+        if outcome:
+            result.update({"outcome_success": outcome.get("success"), "outcome_tool_calls": outcome.get("toolCalls"),
+                           "followup_seconds": round(time.time() - t1, 1)})
+            return result
+        time.sleep(3)
+    result["outcome_success"] = None
+    result["note"] = "follow-up didn't finish in time"
+    return result
+
+
+def _run_job_unsafe(job: dict, scenario: dict, oc: list[str], timeout: int, follow_up: str | None = None,
+                    await_interventions: bool = False) -> dict:
     _seed_folder(job, scenario)
     started = time.time()
+    log_offset = _log_size()
     status, code, out, err = _agent_turn(job, oc, timeout, FRAMING.format(folder=job["folder"],
                                                                          prompt=scenario["prompt"]))
     result = {
@@ -247,6 +312,17 @@ def _run_job_unsafe(job: dict, scenario: dict, oc: list[str], timeout: int, foll
         result.update({"follow_up": follow_up, "follow_up_status": f_status, "first_reply": result["reply"],
                        "follow_up_stdout_tail": f_out[-3000:], "follow_up_stderr_tail": f_err[-1500:]})
         result["reply"] = _reply_text(f_out) or result["reply"]
+    if await_interventions:
+        iv = _await_intervention(job["session_key"], log_offset, timeout)
+        result["intervention"] = iv
+        if iv.get("scheduled"):
+            # The follow-up's reply supersedes the first turn's; grading looks
+            # the latest one up from the session store.
+            result["reply"] = None
+            # A retried run that then finished counts as done: its work is on disk.
+            if status != "done" and iv.get("action") == "retry" and iv.get("outcome_success"):
+                result["status"] = "done"
+                result["recovered_by"] = "retry"
     result["seconds"] = round(time.time() - started, 1)
     return result
 
@@ -268,7 +344,7 @@ def run(args) -> None:
         meta_path.write_text(json.dumps({
             "batch": args.batch, "created": datetime.now(timezone.utc).isoformat(),
             "models": args.models, "reps": args.reps, "only": args.only, "category": args.category,
-            "follow_up": args.follow_up,
+            "follow_up": args.follow_up, "await_interventions": args.await_interventions,
         }, indent=1), encoding="utf-8")
     print(f"{len(jobs)} runs to go ({len(done)} already in the manifest)")
     if args.dry_run:
@@ -282,8 +358,8 @@ def run(args) -> None:
     counts: Counter = Counter()
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
-        futures = {pool.submit(_run_job, j, scenarios[j["scenario"]], oc, args.timeout, args.follow_up): j
-                   for j in jobs}
+        futures = {pool.submit(_run_job, j, scenarios[j["scenario"]], oc, args.timeout, args.follow_up,
+                               args.await_interventions): j for j in jobs}
         for i, future in enumerate(as_completed(futures), 1):
             result = future.result()
             with lock:
@@ -309,6 +385,8 @@ def main() -> None:
     parser.add_argument("--retry-failed", action="store_true", help="re-run jobs whose last status wasn't done")
     parser.add_argument("--follow-up", choices=sorted(FOLLOW_UPS),
                         help="send this follow-up turn, in the same session, after every run that finishes")
+    parser.add_argument("--await-interventions", action="store_true",
+                        help="after each run, wait for the plugin's intervention decision and any follow-up turn it started")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     if args.setup:
