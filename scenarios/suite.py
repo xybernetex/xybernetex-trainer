@@ -490,8 +490,10 @@ SCENARIOS += [
 
 
 from scenarios.hard2 import HARD2  # noqa: E402 - round 2, see that module
+from scenarios.hard3 import HARD3  # noqa: E402 - round 3, held out from the intervention policy
 
 SCENARIOS += HARD2
+SCENARIOS += HARD3
 
 
 def by_id() -> dict[str, dict]:
@@ -503,7 +505,7 @@ def validate() -> None:
     assert len(ids) == len(set(ids)), "duplicate scenario ids"
     for s in SCENARIOS:
         assert s["category"] in {"normal", "error", "loop", "destructive", "sensitive", "budget", "injection", "long",
-                                 "hard", "hard2"}, s["id"]
+                                 "hard", "hard2", "hard3"}, s["id"]
         for action in s.get("must", []) + s.get("must_not", []):
             assert action in {"CONTINUE", "REPLAN", "BLOCK_ACTION", "MODIFY_ACTION", "NARROW_TOOLS",
                               "INJECT_CONTEXT", "REQUEST_USER", "TERMINATE"}, (s["id"], action)

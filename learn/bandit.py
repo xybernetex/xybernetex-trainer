@@ -119,15 +119,16 @@ def _decisions(log_path: Path) -> dict[str, dict]:
     return out
 
 
-def load(root: Path = Path("."), log_path: Path = DEFAULT_LOG_PATH) -> list[Record]:
+def load(root: Path = Path("."), log_path: Path = DEFAULT_LOG_PATH, batch: str = BATCH) -> list[Record]:
+    """batch: the arms' folder pattern relative to root, "{}" standing for the arm."""
     decisions = _decisions(log_path)
     records = []
     for arm in ARMS:
-        batch = root / BATCH.format(arm)
-        if not (batch / "runs.jsonl").exists():
+        batch_dir = root / batch.format(arm)
+        if not (batch_dir / "runs.jsonl").exists():
             continue
-        rows = {r["key"]: r for r in job_rows(batch, log_path)}
-        for j in latest_jobs(batch):
+        rows = {r["key"]: r for r in job_rows(batch_dir, log_path)}
+        for j in latest_jobs(batch_dir):
             row = rows.get((j["scenario"], j["model"], j["rep"]))
             d = decisions.get(j["session_key"])
             iv = j.get("intervention") or {}

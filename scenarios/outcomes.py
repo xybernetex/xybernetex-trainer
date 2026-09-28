@@ -1059,6 +1059,150 @@ for text, width, want in json.loads({cases!r}):
 assert raises(wrap, "a b", 0)""")
 
 
+# ---- hard3 -------------------------------------------------------------------
+# Held-out round (scenarios/hard3.py). Expected answers come from its reference
+# code; code deliverables run hidden tests in the sandbox, with the expected
+# values computed here and passed in as JSON.
+from scenarios import hard3 as H3  # noqa: E402
+
+
+def _lines(r: Run, name: str) -> list[str]:
+    return [l.strip() for l in r.read(name).splitlines() if l.strip()]
+
+
+def _csv_rows(r: Run, name: str, cols: tuple[str, ...]) -> list[tuple] | None:
+    try:
+        return [tuple(x[c].strip() for c in cols) for x in csv.DictReader(io.StringIO(r.read(name)))]
+    except (KeyError, AttributeError):
+        return None
+
+
+@check("hx-semver-sort")
+def _(r):
+    want, got = H3.ref_semver(H3.VERSIONS), _lines(r, "sorted.txt")
+    return Outcome(got == want, detail="" if got == want else f"got {got}, expected {want}")
+
+
+@check("hx-ini-merge")
+def _(r):
+    import json
+    want = H3.ref_ini(H3.BASE_INI, H3.PROD_INI)
+    try:
+        got = json.loads(r.read("config.json"))
+    except ValueError:
+        return Outcome(False, detail="config.json missing or not JSON")
+    return Outcome(got == want, detail="" if got == want else f"got {got}")
+
+
+@check("hx-token-bucket")
+def _(r):
+    import json
+    # json writes float('inf') as Infinity, which json.loads reads back as inf.
+    cases = json.dumps([[list(args), [list(s) for s in steps], want]
+                        for (args, steps), want in zip(H3.BUCKET_SCRIPTS, H3.ref_bucket_results())])
+    return _hidden(r, _RAISES + f"""
+import json, math
+from limiter import TokenBucket
+for args, steps, want in json.loads({cases!r}):
+    b = TokenBucket(*args)
+    for (method, now, cost), w in zip(steps, want):
+        got = getattr(b, method)(now, cost)
+        assert got == w or (isinstance(w, float) and math.isinf(w) and math.isinf(got)), (args, method, now, cost, got, w)
+b = TokenBucket(2, 1.0); b.allow(5.0)
+assert raises(b.allow, 4.0), "time going backwards"
+assert raises(b.allow, 6.0, 3) and raises(b.allow, 6.0, 0), "bad cost"
+assert raises(TokenBucket, 0, 1.0) and raises(TokenBucket, 1, -1.0), "bad constructor\"""")
+
+
+@check("hx-cron-next")
+def _(r):
+    import json
+    return _hidden(r, _RAISES + f"""
+import json
+from datetime import datetime
+from cronnext import next_run
+for expr, after, want in json.loads({json.dumps(H3.ref_cron_expected())!r}):
+    got = next_run(expr, datetime.fromisoformat(after))
+    assert got.isoformat() == want, (expr, after, str(got), want)
+for bad in json.loads({json.dumps(H3.CRON_BAD)!r}):
+    assert raises(next_run, bad, datetime(2026, 1, 1)), bad""")
+
+
+@check("hx-inventory-diff")
+def _(r):
+    import json
+    want = H3.ref_diff()
+    try:
+        got = json.loads(r.read("changes.json"))
+    except ValueError:
+        return Outcome(False, detail="changes.json missing or not JSON")
+    return Outcome(got == want, detail="" if got == want else f"got {got}, expected {want}")
+
+
+@check("hx-timesheet")
+def _(r):
+    want = [tuple(str(v) for v in row) for row in H3.ref_payroll()]
+    got = _csv_rows(r, "payroll.csv", ("employee", "regular_minutes", "overtime_minutes", "pay_cents"))
+    if got is None:
+        return Outcome(False, detail="payroll.csv missing or wrong columns")
+    return Outcome(got == want, detail="" if got == want else f"got {got}, expected {want}")
+
+
+@check("hx-json-flatten")
+def _(r):
+    import json
+    cases = json.dumps([[obj, H3.ref_flatten(obj)] for obj in H3.FLATTEN_CASES])
+    return _hidden(r, _RAISES + f"""
+import json
+from flat import flatten, unflatten
+for obj, want in json.loads({cases!r}):
+    got = flatten(obj)
+    assert got == want, (obj, got, want)
+    assert unflatten(got) == obj, ("roundtrip", obj, unflatten(got))
+for bad in json.loads({json.dumps(H3.UNFLATTEN_BAD)!r}):
+    assert raises(unflatten, bad), bad
+assert raises(flatten, [1, 2]) and raises(flatten, "x")""")
+
+
+@check("hx-md-toc")
+def _(r):
+    want = H3.ref_toc(H3.DOC_MD)
+    got = [l.rstrip() for l in r.read("toc.md").splitlines() if l.strip()]
+    return Outcome(got == want, detail="" if got == want else f"got {got}, expected {want}")
+
+
+@check("hx-messy-csv")
+def _(r):
+    want = H3.ref_messy()
+    got = _csv_rows(r, "totals.csv", ("region", "total"))
+    if got is None:
+        return Outcome(False, detail="totals.csv missing or wrong columns")
+    return Outcome(got == want, detail="" if got == want else f"got {got}, expected {want}")
+
+
+@check("hx-sql-overdraft")
+def _(r):
+    want = [tuple(str(v) for v in row) for row in H3.ref_overdrafts()]
+    got = _csv_rows(r, "overdrafts.csv", ("account_id", "txn_id", "balance_after"))
+    if got is None:
+        return Outcome(False, detail="overdrafts.csv missing or wrong columns")
+    return Outcome(got == want, detail="" if got == want else f"got {got}, expected {want}")
+
+
+@check("hx-shortest-route")
+def _(r):
+    want = H3.ref_routes()
+    got = [" ".join(l.split()) for l in r.read("answers.txt").splitlines() if l.strip()]
+    return Outcome(got == want, detail="" if got == want else f"got {got}, expected {want}")
+
+
+@check("hx-cidr-rules")
+def _(r):
+    want = H3.ref_cidr()
+    got = [" ".join(l.split()) for l in r.read("decisions.txt").splitlines() if l.strip()]
+    return Outcome(got == want, detail="" if got == want else f"got {got}, expected {want}")
+
+
 def evaluate(scenario: dict, folder: Path, reply: str | None,
              sh: Callable[[Path, str], tuple[int, str]] = docker_sh) -> Outcome:
     if not folder.is_dir():
