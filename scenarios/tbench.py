@@ -26,16 +26,21 @@ we only score interventions on them and never publish task content.
 
     python -m scenarios.tbench validate --task archive/fix-git
     python -m scenarios.tbench prototype --task archive/fix-git --model glm53f
+    python -m scenarios.tbench survey --model glm53f --concurrency 3
 """
 from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import subprocess
 import tempfile
 import time
 import tomllib
+import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 
 TBENCH = Path.home() / "tbench"
@@ -43,6 +48,9 @@ OPENCLAW_VERSION = "2026.9.6"
 RUNTIME_IMAGE = f"xyb-openclaw-runtime:{OPENCLAW_VERSION}"
 OC_WORKSPACE = "/root/oc-workspace"  # OpenClaw's own workspace, kept out of the task's directory
 PROVIDER = "workers-ai"
+SESSION = "tb"  # each container runs its own OpenClaw, so one session key serves every run
+OC_STORE = "/root/.openclaw/agents/main/agent"
+SURVEY_DIR = Path(__file__).parent / "batches" / "tb-survey"
 
 
 def sh(args: list[str], timeout: int = 1800, check: bool = True, input_text: str | None = None) -> subprocess.CompletedProcess:
@@ -63,7 +71,7 @@ class Task:
         self.instruction = (self.path / "instruction.md").read_text(encoding="utf-8").strip()
         self.agent_timeout = int((self.cfg.get("agent") or {}).get("timeout_sec") or 900)
         self.verifier_timeout = int((self.cfg.get("verifier") or {}).get("timeout_sec") or 600)
-        self.memory_mb = env.get("memory_mb") or 2048
+        self.memory_mb = min(env.get("memory_mb") or 2048, 12288)  # a limit, not a reservation; Docker has 16 GB
 
     def base_image(self) -> str:
         """The task environment: pulled if prebuilt, else built from environment/."""
@@ -79,6 +87,32 @@ class Task:
     def workdir(self, image: str) -> str:
         wd = (self.cfg.get("environment") or {}).get("workdir")
         return wd or sh(["docker", "image", "inspect", "-f", "{{.Config.WorkingDir}}", image]).stdout.strip() or "/"
+
+
+def candidates(difficulties: tuple[str, ...] = ("easy", "medium")) -> list[str]:
+    """Tasks this harness can run: Linux, CPU-only, single-step, with tests, a
+    reference solution and an environment. Difficulty is the task's label, else
+    its expert-time estimate (<=30 min easy, <=2 h medium)."""
+    out, seen = [], set()
+    for folder in ("tasks", "archive"):
+        for toml in sorted((TBENCH / folder).glob("*/task.toml")):
+            t = toml.parent
+            cfg = tomllib.loads(toml.read_text(encoding="utf-8"))
+            env, meta = cfg.get("environment", {}), cfg.get("metadata", {})
+            if env.get("gpus") or env.get("gpu_types") or env.get("tpu") or env.get("os", "linux") != "linux":
+                continue
+            if (t / "steps").exists() or not (t / "tests" / "test.sh").exists() \
+                    or not (t / "solution" / "solve.sh").exists():
+                continue
+            if not (t / "environment" / "Dockerfile").exists() and not env.get("docker_image"):
+                continue
+            hours = meta.get("expert_time_estimate_hours") or (meta.get("expert_time_estimate_min") or 0) / 60 or None
+            diff = str(meta.get("difficulty") or "").lower() or (
+                None if hours is None else "easy" if hours <= 0.5 else "medium" if hours <= 2 else "hard")
+            if diff in difficulties and t.name not in seen:
+                seen.add(t.name)
+                out.append(f"{folder}/{t.name}")
+    return out
 
 
 def ensure_runtime() -> None:
@@ -197,24 +231,122 @@ def agent_turn(c: Container, model_id: str, session: str, message: str, timeout:
     t0 = time.time()
     p = c.exec(f"openclaw agent --local --session-key agent:main:{session} --model {PROVIDER}/{model_id} "
                f"--timeout {timeout} --message-file /tmp/xyb-message.txt --json", timeout + 180, workdir=OC_WORKSPACE)
-    return {"exit": p.returncode, "seconds": round(time.time() - t0, 1), "stdout_tail": p.stdout[-1500:],
+    return {"exit": p.returncode, "seconds": round(time.time() - t0, 1), "stdout": p.stdout,
             "stderr_tail": p.stderr[-800:]}
 
 
-def prototype(task: Task, model_id: str) -> dict:
-    """One task end to end: first turn, snapshot, a same-session verify branch from
-    the snapshot, and grades for the snapshot and the branch."""
-    from scenarios.run_suite import FOLLOW_UPS
+def transcript(c: Container) -> list[dict]:
+    """The container's session messages, from a copy of its OpenClaw store."""
+    from scenarios.export_calls import _events
+    with tempfile.TemporaryDirectory() as d:
+        sh(["docker", "cp", f"{c.name}:{OC_STORE}", d])
+        conn = sqlite3.connect(Path(d) / "agent" / "openclaw-agent.sqlite")
+        try:
+            return [e["message"] for e in _events(conn, f"agent:main:{SESSION}") if e.get("type") == "message"]
+        finally:
+            conn.close()
+
+
+def _find(o, key: str):
+    if isinstance(o, dict):
+        if key in o:
+            return o[key]
+        for v in o.values():
+            if (r := _find(v, key)) is not None:
+                return r
+    return None
+
+
+def run_summary(stdout: str) -> dict:
+    """stopReason, tool summary and reply from `openclaw agent --json` output."""
+    try:
+        data = json.loads(stdout)
+    except ValueError:
+        return {}
+    payloads = _find(data, "payloads") or []
+    reply = "\n\n".join(p["text"] for p in payloads if isinstance(p, dict) and isinstance(p.get("text"), str))
+    return {"stop_reason": (_find(data, "completion") or {}).get("stopReason"), "tools": _find(data, "toolSummary"),
+            "reply": reply[-2000:] or None}
+
+
+def start_agent(task: Task, model_id: str, turn_timeout: int) -> tuple[Container, dict]:
+    """A configured container of the agent image, after the task's first turn."""
     image = agent_image(task)
     wd = task.workdir(image)
-    out = {"task": task.rel, "model": model_id, "workdir": wd}
     c = Container(image, task.memory_mb, wd)
     try:
         c.put(openclaw_config(model_id), "/root/.openclaw/openclaw.json")
         c.exec(f"mkdir -p {OC_WORKSPACE}", 60, workdir="/")
         message = (f"This is an automated task. The files are in {wd} - work there. Don't ask questions; make "
                    f"reasonable assumptions and finish.\n\nTask: {task.instruction}")
-        out["first"] = agent_turn(c, model_id, "tb", message, min(task.agent_timeout, 900))
+        return c, agent_turn(c, model_id, SESSION, message, min(task.agent_timeout, turn_timeout))
+    except BaseException:
+        c.remove()
+        raise
+
+
+def drop_images(task: Task) -> None:
+    """The task's own images; the shared runtime and base OS images stay."""
+    for tag in (f"xyb-tb-agent:{task.name}", task.image or f"xyb-tb-env:{task.name}"):
+        sh(["docker", "rmi", "-f", tag], check=False)
+
+
+def survey_task(task: Task, model_id: str, turn_timeout: int) -> dict:
+    """Grader check, then one first turn: does the model solve it on its own?"""
+    rec = {"task": task.rel, "model": model_id, "started": datetime.now(timezone.utc).isoformat()}
+    try:
+        rec["grader"] = validate(task)
+        if not rec["grader"]["valid"]:
+            return rec
+        c, turn = start_agent(task, model_id, turn_timeout)
+        try:
+            from scenarios.cf_features import features, tokens
+            msgs = transcript(c)
+            rec["first"] = {"exit": turn["exit"], "seconds": turn["seconds"], **run_summary(turn["stdout"]),
+                            "tokens": tokens(msgs), "features": features(msgs)}
+            if turn["exit"] != 0:
+                rec["first"]["stderr_tail"] = turn["stderr_tail"]
+            rec["reward"] = grade(task, c)["reward"]
+        finally:
+            c.remove()
+    except Exception:  # noqa: BLE001 - one broken task must not stop the survey
+        rec["error"] = traceback.format_exc()[-1500:]
+    finally:
+        drop_images(task)
+    return rec
+
+
+def survey(model_id: str, concurrency: int, turn_timeout: int, only: list[str] | None = None) -> None:
+    """Every candidate task once. Resumable: tasks already surveyed without an error are skipped."""
+    SURVEY_DIR.mkdir(parents=True, exist_ok=True)
+    log = SURVEY_DIR / "survey.jsonl"
+    done = set()
+    if log.exists():
+        done = {(r["task"], r["model"]) for r in map(json.loads, log.read_text(encoding="utf-8").splitlines())
+                if "error" not in r}
+    todo = [t for t in (only or candidates()) if (t, model_id) not in done]
+    print(f"{len(todo)} tasks to survey ({len(done)} done)", flush=True)
+    ensure_runtime()
+    with ThreadPoolExecutor(concurrency) as pool:
+        futures = [pool.submit(survey_task, Task(t), model_id, turn_timeout) for t in todo]
+        for i, f in enumerate(as_completed(futures), 1):
+            rec = f.result()
+            with open(log, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec) + "\n")
+            first = rec.get("first") or {}
+            status = "error" if "error" in rec else "bad-grader" if not rec["grader"]["valid"] else rec.get("reward")
+            print(f"[{i}/{len(todo)}] {rec['task']:<44} {status!s:<10} {first.get('seconds', '-')!s:>7}s "
+                  f"{first.get('tokens', '-')!s:>8} tok  {first.get('stop_reason') or ''}", flush=True)
+
+
+def prototype(task: Task, model_id: str) -> dict:
+    """One task end to end: first turn, snapshot, a same-session verify branch from
+    the snapshot, and grades for the snapshot and the branch."""
+    from scenarios.run_suite import FOLLOW_UPS
+    c, first = start_agent(task, model_id, 900)
+    wd = c.workdir
+    out = {"task": task.rel, "model": model_id, "workdir": wd, "first": {**first, "stdout": first["stdout"][-1500:]}}
+    try:
         snap = c.commit()
         out["snapshot"] = snap
     finally:
@@ -223,7 +355,8 @@ def prototype(task: Task, model_id: str) -> dict:
         b = Container(snap, task.memory_mb, wd)
         try:
             if follow:
-                out[f"{label}_turn"] = agent_turn(b, model_id, "tb", follow, min(task.agent_timeout, 900))
+                turn = agent_turn(b, model_id, SESSION, follow, min(task.agent_timeout, 900))
+                out[f"{label}_turn"] = {**turn, "stdout": turn["stdout"][-1500:]}
             out[label] = grade(task, b)
         finally:
             b.remove()
@@ -233,16 +366,24 @@ def prototype(task: Task, model_id: str) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("command", choices=["validate", "prototype"])
-    parser.add_argument("--task", required=True, help="path under ~/tbench, e.g. archive/fix-git")
+    parser.add_argument("command", choices=["validate", "prototype", "survey", "list"])
+    parser.add_argument("--task", help="path under ~/tbench, e.g. archive/fix-git (survey: a comma list)")
     parser.add_argument("--model", default="glm53f")
+    parser.add_argument("--concurrency", type=int, default=3)
+    parser.add_argument("--turn-timeout", type=int, default=900)
     args = parser.parse_args()
-    task = Task(args.task)
-    if args.command == "validate":
-        print(json.dumps(validate(task), indent=1))
+    from scenarios.run_suite import MODELS
+    model_id = MODELS[args.model][0]
+    if args.command == "list":
+        print("\n".join(candidates()))
+    elif args.command == "survey":
+        survey(model_id, args.concurrency, args.turn_timeout, args.task.split(",") if args.task else None)
+    elif not args.task:
+        parser.error("--task is required")
+    elif args.command == "validate":
+        print(json.dumps(validate(Task(args.task)), indent=1))
     else:
-        from scenarios.run_suite import MODELS
-        print(json.dumps(prototype(task, MODELS[args.model][0]), indent=1))
+        print(json.dumps(prototype(Task(args.task), model_id), indent=1))
 
 
 if __name__ == "__main__":
