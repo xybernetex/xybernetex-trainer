@@ -1,27 +1,31 @@
 """Our tasks, run by OpenAI Agents SDK agents on Workers AI models through the
 Xybernetex Python adapter, graded by our own grader. The same tasks, models,
-prompts and grading as the OpenClaw experiments, so the numbers compare.
+prompts, sandbox and grading as the OpenClaw experiments, so the numbers compare.
 
     pip install openai-agents
     $env:PYTHONPATH = "..\\xybernetex-python\\src"     (the adapter lives in xybernetex-python)
     $env:CF_ACCOUNT_ID = "..."; $env:CF_WORKERS_AI_KEY = "..."
 
     python -m scenarios.sdk_agent --task hh-toposort --model glm53f --verify-model dsv4p
-    python -m scenarios.sdk_agent --category hard2 --model glm53f --verify-model dsv4p --concurrency 2
+    python -m scenarios.sdk_agent --category hard2 --model glm53f --verify-model dsv4p --batch sdk-hard2
 
 Per task: a fresh folder seeded with the task's files; an agent with the four
 tools an OpenClaw coding agent has (run a command, read, write, list),
-confined to that folder; Xybernetex.run with the gate in enforce mode
-(recommended preset, no approvals: holds are explained blocks); the folder
-graded; then, with --verify-model, the adapter's check-your-work turn on that
-model in the same conversation, and the folder graded again. Every run is
-appended to ~/.xybernetex-sdk/runs.jsonl; a category run ends with a table.
+confined to that folder, with commands run in the same Linux sandbox image and
+network as OpenClaw's scenario agent (the folder mounted at /workspace);
+Xybernetex.run with the gate in enforce mode (recommended preset, no
+approvals: holds are explained blocks); the folder graded; then, with
+--verify-model, the adapter's check-your-work turn on that model in the same
+conversation, and the folder graded again. Every run is appended to
+~/.xybernetex-sdk/runs.jsonl; a category run ends with a table. With
+--batch NAME, runs are tagged and tasks already recorded under that name are
+skipped, so an interrupted batch picks up where it stopped. One task failing
+(an API error, a crash) is recorded and never stops the others.
 
 The SDK talks to Workers AI through its OpenAI-compatible chat-completions
 endpoint (the Responses API isn't implemented there). The key is read from
 the environment and never printed. Costs use Workers AI list prices
-(2026-09-28); the SDK's usage doesn't separate cached input, so they are
-upper bounds for models that cache.
+(2026-09-28), with cached input at the cached rate.
 """
 from __future__ import annotations
 
@@ -32,6 +36,7 @@ import os
 import subprocess
 import sys
 import time
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -45,7 +50,7 @@ try:
 except ImportError:  # pragma: no cover
     sys.exit("the adapter isn't importable: set PYTHONPATH to ..\\xybernetex-python\\src (or pip install -e it)")
 
-from scenarios.outcomes import evaluate
+from scenarios.outcomes import IMAGE, evaluate
 from scenarios.run_suite import MODELS
 from scenarios.suite import SCENARIOS
 
@@ -57,12 +62,15 @@ INSTRUCTIONS = (
     "a short summary of what you did."
 )
 OUTPUT_LIMIT = 20_000  # characters of tool output returned to the model
-# USD per million tokens: input, output (developers.cloudflare.com/workers-ai/platform/pricing, 2026-09-28)
+NETWORK = "bridge"  # as OpenClaw's scenarios agent (sandbox.docker.network)
+# USD per million tokens: input, cached input, output
+# (developers.cloudflare.com/workers-ai/platform/pricing, 2026-09-28)
 PRICE = {
-    "@cf/zai-org/glm-5.3-flash": (0.15, 0.50), "@cf/zai-org/glm-5.3": (1.40, 4.40), "@cf/zai-org/glm-4.7-flash": (0.06, 0.40),
-    "@cf/deepseek-ai/deepseek-v4-flash-0731": (0.44, 1.32), "@cf/deepseek-ai/deepseek-v4-pro-0813": (1.32, 3.96),
-    "@cf/qwen/qwen3.8-27b": (0.45, 3.20), "@cf/nvidia/nemotron-3-120b-a12b": (0.50, 1.50),
-    "@cf/google/gemma-4-26b-a4b-it": (0.10, 0.30), "@cf/moonshotai/kimi-k2.7-code": (0.95, 4.00),
+    "@cf/zai-org/glm-5.3-flash": (0.15, 0.03, 0.50), "@cf/zai-org/glm-5.3": (1.40, 0.26, 4.40),
+    "@cf/zai-org/glm-4.7-flash": (0.06, 0.06, 0.40), "@cf/deepseek-ai/deepseek-v4-flash-0731": (0.44, 0.014, 1.32),
+    "@cf/deepseek-ai/deepseek-v4-pro-0813": (1.32, 0.044, 3.96), "@cf/qwen/qwen3.8-27b": (0.45, 0.45, 3.20),
+    "@cf/nvidia/nemotron-3-120b-a12b": (0.50, 0.50, 1.50), "@cf/google/gemma-4-26b-a4b-it": (0.10, 0.10, 0.30),
+    "@cf/moonshotai/kimi-k2.7-code": (0.95, 0.19, 4.00),
 }
 
 
@@ -73,10 +81,33 @@ def client_from_env() -> AsyncOpenAI:
     return AsyncOpenAI(base_url=f"https://api.cloudflare.com/client/v4/accounts/{account}/ai/v1", api_key=key)
 
 
-def make_tools(folder: Path) -> list:
+class Sandbox:
+    """One container per task: OpenClaw's scenario sandbox image, the task folder
+    mounted read-write at /workspace, kept alive for the run's commands."""
+
+    def __init__(self, folder: Path):
+        self.id = subprocess.run(
+            ["docker", "run", "-d", "--rm", "--network", NETWORK, "-v", f"{folder.resolve()}:/workspace",
+             "-w", "/workspace", "-e", "PYTHONDONTWRITEBYTECODE=1", IMAGE, "sleep", "infinity"],
+            capture_output=True, text=True, check=True).stdout.strip()
+
+    def run(self, command: str, timeout: int) -> tuple[int, str]:
+        try:
+            p = subprocess.run(["docker", "exec", "-w", "/workspace", self.id, "timeout", str(timeout), "bash", "-c", command],
+                               capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout + 30)
+        except subprocess.TimeoutExpired:
+            return 124, ""
+        return p.returncode, p.stdout + ("\n[stderr]\n" + p.stderr if p.stderr.strip() else "")
+
+    def close(self) -> None:
+        subprocess.run(["docker", "rm", "-f", self.id], capture_output=True)
+
+
+def make_tools(folder: Path, sandbox: Sandbox) -> list:
     """The agent's tools, confined to `folder`. Paths are relative to it."""
 
     def inside(rel: str) -> Path:
+        rel = rel.removeprefix("/workspace/").removeprefix("/workspace")
         p = (folder / rel).resolve()
         if p != folder.resolve() and folder.resolve() not in p.parents:
             raise ValueError(f"{rel!r} is outside the task folder")
@@ -86,20 +117,18 @@ def make_tools(folder: Path) -> list:
         return text if len(text) <= OUTPUT_LIMIT else text[:OUTPUT_LIMIT] + f"\n...[{len(text) - OUTPUT_LIMIT} more characters]"
 
     @function_tool
-    def run_command(command: str, timeout_seconds: int = 60) -> str:
-        """Run a shell command in the task folder and return its output and exit status.
+    async def run_command(command: str, timeout_seconds: int = 60) -> str:
+        """Run a bash command in the task folder (a Linux sandbox) and return its output and exit status.
 
         Args:
-            command: The command line to run (Python is available as python3 and python).
+            command: The command line to run (Python is python3; git, node and curl are installed).
             timeout_seconds: Kill the command after this many seconds.
         """
-        try:
-            p = subprocess.run(command, shell=True, cwd=folder, capture_output=True, text=True,
-                               encoding="utf-8", errors="replace", timeout=max(1, min(timeout_seconds, 600)))
-        except subprocess.TimeoutExpired:
-            return f"timed out after {timeout_seconds}s"
-        out = p.stdout + ("\n[stderr]\n" + p.stderr if p.stderr.strip() else "")
-        return clip(out.rstrip() + f"\n[exit {p.returncode}]")
+        limit = max(1, min(timeout_seconds, 600))
+        code, out = await asyncio.to_thread(sandbox.run, command, limit)
+        if code == 124:
+            out += f"\ntimed out after {limit}s"
+        return clip(out.rstrip() + f"\n[exit {code}]")
 
     @function_tool
     def read_file(path: str) -> str:
@@ -153,14 +182,22 @@ def seed(scenario: dict) -> Path:
 
 def usage_of(result) -> dict:
     u = result.context_wrapper.usage
-    return {"requests": u.requests, "input": u.input_tokens, "output": u.output_tokens, "total": u.total_tokens}
+    cached = getattr(u.input_tokens_details, "cached_tokens", 0) or 0
+    return {"requests": u.requests, "input": u.input_tokens, "cached": cached, "output": u.output_tokens,
+            "total": u.total_tokens}
 
 
 def dollars(usage: dict | None, model_id: str) -> float:
     if not usage or model_id not in PRICE:
         return 0.0
-    pi, po = PRICE[model_id]
-    return (usage["input"] * pi + usage["output"] * po) / 1e6
+    pi, pc, po = PRICE[model_id]
+    cached = min(usage.get("cached", 0), usage["input"])
+    return ((usage["input"] - cached) * pi + cached * pc + usage["output"] * po) / 1e6
+
+
+def gate_summary(events: list[dict]) -> list[dict]:
+    return [{k: e[k] for k in ("type", "action", "authorization", "riskTier", "toolName") if k in e}
+            for e in events if e["type"].startswith("tool_gate") and e["type"] != "tool_gate_ready"]
 
 
 async def run_task(scenario: dict, args, client: AsyncOpenAI, sem: asyncio.Semaphore) -> dict:
@@ -168,38 +205,72 @@ async def run_task(scenario: dict, args, client: AsyncOpenAI, sem: asyncio.Semap
     model = lambda short: OpenAIChatCompletionsModel(model=MODELS[short][0], openai_client=client)  # noqa: E731
     async with sem:
         folder = seed(scenario)
-        agent = Agent(name="worker", instructions=INSTRUCTIONS, model=model(args.model), tools=make_tools(folder))
-        events: list[dict] = []
-        xyb = Xybernetex(mode="enforce", preset="recommended", approvals=False, log=events.append,
-                         followups={"mode": "act" if args.verify_model else "observe"})
+        out = {"task": scenario["id"], "model": args.model, "batch": args.batch, "folder": str(folder),
+               "at": datetime.now(timezone.utc).isoformat()}
         t0 = time.time()
-        report = await xyb.run(agent, scenario["prompt"], session_key=folder.name, max_turns=args.max_turns,
-                               followup_model=model(args.verify_model) if args.verify_model else None)
-        out = {"task": scenario["id"], "model": args.model, "folder": str(folder),
-               "at": datetime.now(timezone.utc).isoformat(), "seconds": round(time.time() - t0, 1)}
-        reply = report.result.final_output if report.result else None
-        grade = evaluate(scenario, folder, reply)
-        usage = usage_of(report.result) if report.result else None
-        out["first"] = {"status": report.status, "error": report.error, "seconds": report.seconds, "usage": usage,
-                        "dollars": round(dollars(usage, MODELS[args.model][0]), 5), "passed": grade.task,
-                        "detail": grade.detail, "reply": (reply or "")[-600:], "decision": report.decision,
-                        "gate": [{k: v for k, v in e.items() if k in ("type", "action", "authorization", "riskTier", "toolName")}
-                                 for e in events if e["type"].startswith("tool_gate") and e["type"] != "tool_gate_ready"]}
-        if report.followup is not None:
-            reply2 = report.followup.final_output
-            grade2 = evaluate(scenario, folder, reply2)
-            usage2 = usage_of(report.followup)
-            out["verify"] = {"model": args.verify_model, "usage": usage2, "passed": grade2.task, "detail": grade2.detail,
-                             "dollars": round(dollars(usage2, MODELS[args.verify_model][0]), 5), "reply": (reply2 or "")[-600:]}
+        try:
+            sandbox = await asyncio.to_thread(Sandbox, folder)
+            try:
+                agent = Agent(name="worker", instructions=INSTRUCTIONS, model=model(args.model),
+                              tools=make_tools(folder, sandbox))
+                events: list[dict] = []
+                xyb = Xybernetex(mode="enforce", preset="recommended", approvals=False, log=events.append,
+                                 followups={"mode": "act" if args.verify_model else "observe"})
+                report = await xyb.run(agent, scenario["prompt"], session_key=folder.name, max_turns=args.max_turns,
+                                       followup_model=model(args.verify_model) if args.verify_model else None)
+            finally:
+                await asyncio.to_thread(sandbox.close)
+            out["seconds"] = round(time.time() - t0, 1)
+            reply = report.result.final_output if report.result else None
+            grade = await asyncio.to_thread(evaluate, scenario, folder, reply)
+            usage = usage_of(report.result) if report.result else None
+            out["first"] = {"status": report.status, "error": report.error, "seconds": report.seconds, "usage": usage,
+                            "dollars": round(dollars(usage, MODELS[args.model][0]), 5), "passed": grade.task,
+                            "detail": grade.detail, "reply": (reply or "")[-600:], "decision": report.decision,
+                            "gate": gate_summary(events)}
+            if report.followup is not None:
+                reply2 = report.followup.final_output
+                grade2 = await asyncio.to_thread(evaluate, scenario, folder, reply2)
+                usage2 = usage_of(report.followup)
+                out["verify"] = {"model": args.verify_model, "usage": usage2, "passed": grade2.task, "detail": grade2.detail,
+                                 "dollars": round(dollars(usage2, MODELS[args.verify_model][0]), 5),
+                                 "reply": (reply2 or "")[-600:]}
+        except Exception as e:  # noqa: BLE001 - one task's crash is a result, not the end of the batch
+            out["seconds"] = round(time.time() - t0, 1)
+            out["crash"] = f"{type(e).__name__}: {e}"[:300]
+            traceback.print_exc()
         RUNS.mkdir(parents=True, exist_ok=True)
         with open(RUNS / "runs.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps(out, default=str) + "\n")
-        f1, v = out["first"], out.get("verify")
-        print(f"{scenario['id']:<18} first {'PASS' if f1['passed'] else 'fail':<4} {f1['status']:<6} "
-              f"{(f1['usage'] or {}).get('total', 0):>7} tok ${f1['dollars']:.4f}"
-              + (f"   verify {'PASS' if v['passed'] else 'fail':<4} {v['usage']['total']:>7} tok ${v['dollars']:.4f}" if v else "")
-              + (f"   gate: {', '.join(e['action'] or e['type'] for e in f1['gate'])}" if f1["gate"] else ""), flush=True)
+        print(line_for(out), flush=True)
         return out
+
+
+def line_for(r: dict) -> str:
+    if "crash" in r:
+        return f"{r['task']:<18} CRASH {r['crash'][:100]}"
+    f1, v = r["first"], r.get("verify")
+    return (f"{r['task']:<18} first {'PASS' if f1['passed'] else 'fail':<4} {f1['status']:<6} "
+            f"{(f1['usage'] or {}).get('total', 0):>7} tok ${f1['dollars']:.4f}"
+            + (f"   verify {'PASS' if v['passed'] else 'fail':<4} {v['usage']['total']:>7} tok ${v['dollars']:.4f}" if v else "")
+            + (f"   gate: {', '.join(e.get('action') or e['type'] for e in f1['gate'])}" if f1["gate"] else "")
+            + f"   {r['seconds']:.0f}s")
+
+
+def summary(results: list[dict], verify: bool) -> str:
+    ran = [r for r in results if "crash" not in r]
+    n = len(ran)
+    first_pass = sum(1 for r in ran if r["first"]["passed"])
+    first_cost = sum(r["first"]["dollars"] for r in ran)
+    line = f"\n{n} tasks: first turn {first_pass}/{n} passed ({first_pass / max(n, 1):.0%}), ${first_cost:.4f}"
+    if verify:
+        after = sum(1 for r in ran if (r.get("verify") or r["first"])["passed"])
+        total = first_cost + sum((r.get("verify") or {}).get("dollars", 0) for r in ran)
+        line += (f"; after the check {after}/{n} ({after / max(n, 1):.0%}), ${total:.4f} total"
+                 f" = ${total / max(after, 1):.4f} per completed task (first turn alone: ${first_cost / max(first_pass, 1):.4f})")
+    blocked = sum(1 for r in ran for e in r["first"]["gate"] if e.get("action") == "BLOCK_ACTION")
+    crashed = len(results) - n
+    return line + f"; gate blocks: {blocked}" + (f"; crashed: {crashed} (rerun the same command to retry them)" if crashed else "")
 
 
 async def main() -> None:
@@ -209,7 +280,8 @@ async def main() -> None:
     parser.add_argument("--model", default="glm53f", help=f"short name: {', '.join(MODELS)}")
     parser.add_argument("--verify-model", help="the adapter runs a check-your-work turn on this model afterwards")
     parser.add_argument("--max-turns", type=int, default=40, help="tool-call rounds before the SDK stops a run")
-    parser.add_argument("--concurrency", type=int, default=2)
+    parser.add_argument("--concurrency", type=int, default=3)
+    parser.add_argument("--batch", help="tag runs with this name and skip tasks already recorded under it")
     args = parser.parse_args()
     if args.task:
         chosen = [s for s in SCENARIOS if s["id"] == args.task]
@@ -223,25 +295,25 @@ async def main() -> None:
         if m and m not in MODELS:
             sys.exit(f"unknown model {m!r}; known: {', '.join(MODELS)}")
 
+    done: list[dict] = []
+    if args.batch and (RUNS / "runs.jsonl").is_file():
+        with open(RUNS / "runs.jsonl", encoding="utf-8") as f:
+            done = [r for r in map(json.loads, f) if r.get("batch") == args.batch and "crash" not in r]
+        finished = {r["task"] for r in done}
+        chosen = [s for s in chosen if s["id"] not in finished]
+        if done:
+            print(f"batch {args.batch}: {len(done)} task(s) already done, {len(chosen)} to go", flush=True)
+            for r in done:
+                print(line_for(r))
+
     client = client_from_env()
     set_tracing_disabled(True)  # tracing would go to OpenAI, with the wrong key
     sem = asyncio.Semaphore(max(1, args.concurrency))
     print(f"{len(chosen)} task(s) on {args.model}" + (f", check on {args.verify_model}" if args.verify_model else "")
           + f", {args.concurrency} at a time", flush=True)
-    results = await asyncio.gather(*(run_task(s, args, client, sem) for s in chosen))
-
+    results = done + list(await asyncio.gather(*(run_task(s, args, client, sem) for s in chosen)))
     if len(results) > 1:
-        n = len(results)
-        first_pass = sum(1 for r in results if r["first"]["passed"])
-        first_cost = sum(r["first"]["dollars"] for r in results)
-        line = f"\n{n} tasks: first turn {first_pass}/{n} passed ({first_pass / n:.0%}), ${first_cost:.4f}"
-        if args.verify_model:
-            after = sum(1 for r in results if (r.get("verify") or r["first"])["passed"])
-            total = first_cost + sum((r.get("verify") or {}).get("dollars", 0) for r in results)
-            line += (f"; after the check {after}/{n} ({after / n:.0%}), ${total:.4f} total"
-                     f" = ${total / max(after, 1):.4f} per completed task (first turn alone: ${first_cost / max(first_pass, 1):.4f})")
-        blocked = sum(1 for r in results for e in r["first"]["gate"] if e["action"] == "BLOCK_ACTION")
-        print(line + f"; gate blocks: {blocked}", flush=True)
+        print(summary(results, bool(args.verify_model)), flush=True)
     print(f"\nlog: {RUNS / 'runs.jsonl'}")
 
 
