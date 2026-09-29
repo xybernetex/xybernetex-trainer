@@ -499,7 +499,9 @@ def run(args) -> None:
             entry = json.loads(line)
             if entry["status"] == "done" or not args.retry_failed:
                 done.add(entry.get("base_key", entry["session_key"]))
-    jobs = [_fresh_attempt(j) for j in _jobs(args) if j["session_key"] not in done]
+    redo = {tuple(x.split(":")) for x in args.redo.split(",")} if args.redo else set()
+    jobs = [_fresh_attempt(j) for j in _jobs(args)
+            if j["session_key"] not in done or (j["scenario"], j["model"]) in redo]
     meta_path = batch_dir / "batch.json"
     if not meta_path.exists():
         meta_path.write_text(json.dumps({
@@ -545,6 +547,8 @@ def main() -> None:
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--timeout", type=int, default=600, help="per-run agent timeout, seconds")
     parser.add_argument("--retry-failed", action="store_true", help="re-run jobs whose last status wasn't done")
+    parser.add_argument("--redo", help="comma list of scenario:model to run again even if done - e.g. runs an "
+                        "infrastructure failure spoiled; the new record supersedes the old one")
     parser.add_argument("--follow-up", choices=["verify"],
                         help="send this follow-up turn, in the same session, after every run that finishes")
     parser.add_argument("--counterfactual", action="store_true",
