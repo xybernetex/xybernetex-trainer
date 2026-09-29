@@ -158,6 +158,9 @@ async def main() -> None:
     parser.add_argument("--model", default="glm53f", help=f"short name: {', '.join(MODELS)}")
     parser.add_argument("--verify-model", help="run a check-your-work turn on this model afterwards")
     parser.add_argument("--max-turns", type=int, default=40, help="tool-call rounds before the SDK stops the run")
+    parser.add_argument("--xybernetex", action="store_true",
+                        help="run through the xybernetex-python adapter (gate, deaths, follow-ups) instead of bare Runner.run; "
+                             "needs that package importable, e.g. PYTHONPATH=../xybernetex-python/src")
     args = parser.parse_args()
     scenario = next((s for s in SCENARIOS if s["id"] == args.task), None)
     if scenario is None:
@@ -172,25 +175,48 @@ async def main() -> None:
     tools = make_tools(folder)
     model = lambda short: OpenAIChatCompletionsModel(model=MODELS[short][0], openai_client=client)  # noqa: E731
     out = {"task": scenario["id"], "model": args.model, "folder": str(folder)}
-
     agent = Agent(name="worker", instructions=INSTRUCTIONS, model=model(args.model), tools=tools)
-    result, status, seconds = await turn(agent, scenario["prompt"], args.max_turns)
-    reply = result.final_output if result else None
-    grade = evaluate(scenario, folder, reply)
-    out["first"] = {"status": status, "seconds": seconds, "usage": usage_of(result) if result else None,
-                    "passed": grade.task, "detail": grade.detail, "reply": (reply or "")[-600:]}
-    print(json.dumps(out["first"], indent=1), flush=True)
 
-    if args.verify_model and result:
-        checker = Agent(name="checker", instructions=INSTRUCTIONS, model=model(args.verify_model), tools=tools)
-        history = result.to_input_list() + [{"role": "user", "content": FOLLOW_UPS["verify"]}]
-        result2, status2, seconds2 = await turn(checker, history, args.max_turns)
-        reply2 = result2.final_output if result2 else reply
-        grade2 = evaluate(scenario, folder, reply2)
-        out["verify"] = {"model": args.verify_model, "status": status2, "seconds": seconds2,
-                         "usage": usage_of(result2) if result2 else None, "passed": grade2.task,
-                         "detail": grade2.detail, "reply": (reply2 or "")[-600:]}
-        print(json.dumps(out["verify"], indent=1), flush=True)
+    if args.xybernetex:
+        # The real product path: the gate on every tool call, death detection, and the
+        # follow-up decided and run by the adapter (xybernetex-python), graded here.
+        from xybernetex.openai_agents import Xybernetex
+        events = []
+        xyb = Xybernetex(mode="enforce", preset="recommended", approvals=False, log=events.append,
+                         followups={"mode": "act" if args.verify_model else "observe"})
+        report = await xyb.run(agent, scenario["prompt"], session_key=folder.name, max_turns=args.max_turns,
+                               followup_model=model(args.verify_model) if args.verify_model else None)
+        reply = report.result.final_output if report.result else None
+        grade = evaluate(scenario, folder, reply)
+        out["first"] = {"status": report.status, "error": report.error, "seconds": report.seconds,
+                        "usage": usage_of(report.result) if report.result else None, "passed": grade.task,
+                        "detail": grade.detail, "reply": (reply or "")[-600:], "decision": report.decision,
+                        "gate": [e for e in events if e["type"].startswith("tool_gate") and e["type"] != "tool_gate_ready"]}
+        print(json.dumps(out["first"], indent=1, default=str), flush=True)
+        if report.followup is not None:
+            reply2 = report.followup.final_output
+            grade2 = evaluate(scenario, folder, reply2)
+            out["verify"] = {"model": args.verify_model, "usage": usage_of(report.followup), "passed": grade2.task,
+                             "detail": grade2.detail, "reply": (reply2 or "")[-600:]}
+            print(json.dumps(out["verify"], indent=1, default=str), flush=True)
+    else:
+        result, status, seconds = await turn(agent, scenario["prompt"], args.max_turns)
+        reply = result.final_output if result else None
+        grade = evaluate(scenario, folder, reply)
+        out["first"] = {"status": status, "seconds": seconds, "usage": usage_of(result) if result else None,
+                        "passed": grade.task, "detail": grade.detail, "reply": (reply or "")[-600:]}
+        print(json.dumps(out["first"], indent=1), flush=True)
+
+        if args.verify_model and result:
+            checker = Agent(name="checker", instructions=INSTRUCTIONS, model=model(args.verify_model), tools=tools)
+            history = result.to_input_list() + [{"role": "user", "content": FOLLOW_UPS["verify"]}]
+            result2, status2, seconds2 = await turn(checker, history, args.max_turns)
+            reply2 = result2.final_output if result2 else reply
+            grade2 = evaluate(scenario, folder, reply2)
+            out["verify"] = {"model": args.verify_model, "status": status2, "seconds": seconds2,
+                             "usage": usage_of(result2) if result2 else None, "passed": grade2.task,
+                             "detail": grade2.detail, "reply": (reply2 or "")[-600:]}
+            print(json.dumps(out["verify"], indent=1), flush=True)
 
     log = RUNS / "runs.jsonl"
     with open(log, "a", encoding="utf-8") as f:
