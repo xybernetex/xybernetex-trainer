@@ -86,6 +86,11 @@ FOLLOW_UPS = {
         "4. Check the edge cases and exact formats the request mentions.\n"
         "If anything is missing or wrong, fix it now. Then give your final answer again in full."
     ),
+    # Same text as the plugin's retry turn (xybernetex-openclaw src/interventions.js).
+    "retry": (
+        "Your previous turn ended before the task was finished (the model's response couldn't be used). "
+        "Continue the original task from where it stopped. Check what's already done first, then finish the rest."
+    ),
 }
 
 
@@ -189,7 +194,7 @@ def _reply_text(stdout: str) -> str | None:
 
 
 def _run_job(job: dict, scenario: dict, oc: list[str], timeout: int, follow_up: str | None = None,
-             await_interventions: bool = False) -> dict:
+             await_interventions: bool = False, counterfactual: bool = False) -> dict:
     """Never raises: an unhandled exception here used to propagate through
     future.result() in run()'s main loop and crash the whole batch, throwing
     away every other job still in flight or already completed this pass -
@@ -197,7 +202,7 @@ def _run_job(job: dict, scenario: dict, oc: list[str], timeout: int, follow_up: 
     git scenario (see _clear_readonly_and_retry) took down 557 queued jobs."""
     started = time.time()
     try:
-        return _run_job_unsafe(job, scenario, oc, timeout, follow_up, await_interventions)
+        return _run_job_unsafe(job, scenario, oc, timeout, follow_up, await_interventions, counterfactual)
     except Exception as exc:  # noqa: BLE001 - genuinely must not propagate, see above
         return {**job, "status": "crashed", "exit_code": None,
                 "started": datetime.fromtimestamp(started, timezone.utc).isoformat(),
@@ -227,6 +232,23 @@ def _agent_turn(job: dict, oc: list[str], timeout: int, message: str) -> tuple[s
 
 
 PLUGIN_LOG = Path.home() / ".openclaw" / "xybernetex-supervisor.jsonl"
+
+
+def _plugin_acting() -> bool:
+    """Is the plugin's latest interventions_ready line in act mode?"""
+    try:
+        with open(PLUGIN_LOG, "rb") as f:
+            f.seek(max(0, PLUGIN_LOG.stat().st_size - 2_000_000))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return False
+    for line in reversed(lines):
+        if '"interventions_ready"' in line:
+            try:
+                return json.loads(line).get("mode") == "act"
+            except ValueError:
+                return False
+    return False
 
 
 def _log_size() -> int:
@@ -288,8 +310,66 @@ def _await_intervention(session_key: str, offset: int, timeout: int, decision_wa
     return result
 
 
+def _transcript(session_key: str, since: datetime) -> list[dict]:
+    """This job's messages from OpenClaw's session store (read-only), from its start."""
+    import sqlite3
+    from scenarios.export_calls import _events
+    from scenarios.outcomes import SESSION_DB
+    conn = sqlite3.connect(f"file:{SESSION_DB}?mode=ro", uri=True)
+    try:
+        out = []
+        for e in _events(conn, session_key):
+            ts = e.get("timestamp")
+            if e.get("type") == "message" and (not ts or datetime.fromisoformat(ts.replace("Z", "+00:00")) >= since):
+                out.append(e["message"])
+        return out
+    finally:
+        conn.close()
+
+
+def _counterfactual(job: dict, scenario: dict, oc: list[str], timeout: int, result: dict, started: float) -> dict:
+    """Both outcomes of one run (scenarios/cf_features.py): grade the folder as
+    the first turn left it - a copy, so the follow-up can't touch it - then
+    send the follow-up in the same session (verify if the run finished, retry
+    if it died) and grade the folder again. A run the harness timed out gets
+    neither: its run may still be going inside the gateway."""
+    from scenarios.cf_features import features, split_turns, tokens
+    from scenarios.outcomes import evaluate
+    folder = WORKSPACE / job["folder"]
+    snapshot = folder.with_name(folder.name + ".before")
+    if snapshot.exists():
+        shutil.rmtree(snapshot, onexc=_clear_readonly_and_retry)
+    shutil.copytree(folder, snapshot)
+    status, first_reply = result["status"], result.get("reply")
+    b = evaluate(scenario, snapshot, first_reply)
+    # A run that died gave the user no answer, whatever is on disk.
+    cf = {"before": {"task": b.task if status == "done" else False, "graded": b.task, "detail": b.detail[:200]},
+          "action": None, "after": None}
+    if status in ("done", "failed"):
+        action = "verify" if status == "done" else "retry"
+        t1 = time.time()
+        f_status, _code, f_out, f_err = _agent_turn(job, oc, timeout, FOLLOW_UPS[action])
+        f_reply = _reply_text(f_out)
+        a = evaluate(scenario, folder, f_reply or first_reply)
+        # A verify turn that dies leaves the first answer standing; a retry that dies is still a failure.
+        after = a.task if (f_status == "done" or action == "verify") else False
+        cf.update(action=action, follow_up_status=f_status, follow_up_seconds=round(time.time() - t1, 1),
+                  after={"task": after, "graded": a.task, "detail": a.detail[:200]},
+                  follow_up_stderr_tail=f_err[-500:])
+        if f_reply:
+            result["reply"] = f_reply
+    else:
+        cf["note"] = f"first turn {status}: no follow-up"
+    try:
+        first, follow = split_turns(_transcript(job["session_key"], datetime.fromtimestamp(started, timezone.utc)))
+        cf.update(features=features(first), tokens_first=tokens(first), tokens_follow_up=tokens(follow))
+    except Exception as exc:  # noqa: BLE001 - features are extra; the grades are the data
+        cf["features_error"] = f"{type(exc).__name__}: {exc}"[:200]
+    return cf
+
+
 def _run_job_unsafe(job: dict, scenario: dict, oc: list[str], timeout: int, follow_up: str | None = None,
-                    await_interventions: bool = False) -> dict:
+                    await_interventions: bool = False, counterfactual: bool = False) -> dict:
     _seed_folder(job, scenario)
     started = time.time()
     log_offset = _log_size()
@@ -312,6 +392,8 @@ def _run_job_unsafe(job: dict, scenario: dict, oc: list[str], timeout: int, foll
         result.update({"follow_up": follow_up, "follow_up_status": f_status, "first_reply": result["reply"],
                        "follow_up_stdout_tail": f_out[-3000:], "follow_up_stderr_tail": f_err[-1500:]})
         result["reply"] = _reply_text(f_out) or result["reply"]
+    if counterfactual:
+        result["counterfactual"] = _counterfactual(job, scenario, oc, timeout, result, started)
     if await_interventions:
         iv = _await_intervention(job["session_key"], log_offset, timeout)
         result["intervention"] = iv
@@ -345,6 +427,7 @@ def run(args) -> None:
             "batch": args.batch, "created": datetime.now(timezone.utc).isoformat(),
             "models": args.models, "reps": args.reps, "only": args.only, "category": args.category,
             "follow_up": args.follow_up, "await_interventions": args.await_interventions,
+            "counterfactual": args.counterfactual,
         }, indent=1), encoding="utf-8")
     print(f"{len(jobs)} runs to go ({len(done)} already in the manifest)")
     if args.dry_run:
@@ -359,7 +442,7 @@ def run(args) -> None:
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
         futures = {pool.submit(_run_job, j, scenarios[j["scenario"]], oc, args.timeout, args.follow_up,
-                               args.await_interventions): j for j in jobs}
+                               args.await_interventions, args.counterfactual): j for j in jobs}
         for i, future in enumerate(as_completed(futures), 1):
             result = future.result()
             with lock:
@@ -383,12 +466,20 @@ def main() -> None:
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--timeout", type=int, default=600, help="per-run agent timeout, seconds")
     parser.add_argument("--retry-failed", action="store_true", help="re-run jobs whose last status wasn't done")
-    parser.add_argument("--follow-up", choices=sorted(FOLLOW_UPS),
+    parser.add_argument("--follow-up", choices=["verify"],
                         help="send this follow-up turn, in the same session, after every run that finishes")
+    parser.add_argument("--counterfactual", action="store_true",
+                        help="grade each run before and after a harness follow-up (verify if it finished, retry if it "
+                             "died), recording both outcomes and decision-time features (scenarios/cf_features.py)")
     parser.add_argument("--await-interventions", action="store_true",
                         help="after each run, wait for the plugin's intervention decision and any follow-up turn it started")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if args.counterfactual and (args.follow_up or args.await_interventions):
+        sys.exit("--counterfactual sends its own follow-up; don't combine it with --follow-up or --await-interventions")
+    if args.counterfactual and _plugin_acting():
+        sys.exit("the plugin's interventions are in act mode, so it would add its own follow-ups to the runs; "
+                 "set interventions.mode to observe first")
     if args.setup:
         setup_models()
     else:
