@@ -43,6 +43,9 @@ import numpy as np
 from learn.bandit import model_group
 from scenarios.cf_features import FEATURE_NAMES
 
+# v0-targeted was the live /intervene rule until 2026-09-29, kept here for comparison. The
+# live rule since (v1-uniform) is always:verify-same on finished runs and always:retry-same
+# on dead ones, both already among the fixed policies below.
 V0_ACTION = {"finished": "verify-same", "died": "retry-same"}
 VERIFY_HELPS_V0 = {"helps": True, "wastes": False, "unknown": True}  # v0-targeted at its most likely draw
 
