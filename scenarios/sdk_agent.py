@@ -1,21 +1,27 @@
-"""One of our tasks, run by an OpenAI Agents SDK agent on a Workers AI model,
-graded by our own grader. The first step of the Python port: the same tasks,
-models and grading as the OpenClaw experiments, so results compare directly.
+"""Our tasks, run by OpenAI Agents SDK agents on Workers AI models through the
+Xybernetex Python adapter, graded by our own grader. The same tasks, models,
+prompts and grading as the OpenClaw experiments, so the numbers compare.
 
     pip install openai-agents
-    set CF_ACCOUNT_ID=...          (PowerShell: $env:CF_ACCOUNT_ID = "...")
-    set CF_WORKERS_AI_KEY=...
-    python -m scenarios.sdk_agent --task hh-toposort --model glm53f
-    python -m scenarios.sdk_agent --task hh-toposort --model glm53f --verify-model dsv4p
+    $env:PYTHONPATH = "..\\xybernetex-python\\src"     (the adapter lives in xybernetex-python)
+    $env:CF_ACCOUNT_ID = "..."; $env:CF_WORKERS_AI_KEY = "..."
 
-The SDK talks to Workers AI through its OpenAI-compatible endpoint (the same
-one OpenClaw uses), so a run costs what our experiments cost, not GPT prices.
-Chat completions, not the Responses API: Workers AI implements only the former.
-The agent gets the four tools an OpenClaw coding agent has (run a command,
-read, write, list), confined to a fresh folder seeded with the task's files.
---verify-model runs a check-your-work turn on a second model in the same
-conversation - the "stronger model does the follow-up" lever - and grades
-the folder again. The key is read from the environment and never printed.
+    python -m scenarios.sdk_agent --task hh-toposort --model glm53f --verify-model dsv4p
+    python -m scenarios.sdk_agent --category hard2 --model glm53f --verify-model dsv4p --concurrency 2
+
+Per task: a fresh folder seeded with the task's files; an agent with the four
+tools an OpenClaw coding agent has (run a command, read, write, list),
+confined to that folder; Xybernetex.run with the gate in enforce mode
+(recommended preset, no approvals: holds are explained blocks); the folder
+graded; then, with --verify-model, the adapter's check-your-work turn on that
+model in the same conversation, and the folder graded again. Every run is
+appended to ~/.xybernetex-sdk/runs.jsonl; a category run ends with a table.
+
+The SDK talks to Workers AI through its OpenAI-compatible chat-completions
+endpoint (the Responses API isn't implemented there). The key is read from
+the environment and never printed. Costs use Workers AI list prices
+(2026-09-28); the SDK's usage doesn't separate cached input, so they are
+upper bounds for models that cache.
 """
 from __future__ import annotations
 
@@ -30,14 +36,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 try:
-    from agents import Agent, OpenAIChatCompletionsModel, Runner, function_tool, set_tracing_disabled
-    from agents.exceptions import MaxTurnsExceeded
+    from agents import Agent, OpenAIChatCompletionsModel, function_tool, set_tracing_disabled
     from openai import AsyncOpenAI
 except ImportError as e:  # pragma: no cover
     sys.exit(f"missing package ({e.name}): pip install openai-agents")
+try:
+    from xybernetex.openai_agents import Xybernetex
+except ImportError:  # pragma: no cover
+    sys.exit("the adapter isn't importable: set PYTHONPATH to ..\\xybernetex-python\\src (or pip install -e it)")
 
 from scenarios.outcomes import evaluate
-from scenarios.run_suite import FOLLOW_UPS, MODELS
+from scenarios.run_suite import MODELS
 from scenarios.suite import SCENARIOS
 
 RUNS = Path.home() / ".xybernetex-sdk"
@@ -48,6 +57,13 @@ INSTRUCTIONS = (
     "a short summary of what you did."
 )
 OUTPUT_LIMIT = 20_000  # characters of tool output returned to the model
+# USD per million tokens: input, output (developers.cloudflare.com/workers-ai/platform/pricing, 2026-09-28)
+PRICE = {
+    "@cf/zai-org/glm-5.3-flash": (0.15, 0.50), "@cf/zai-org/glm-5.3": (1.40, 4.40), "@cf/zai-org/glm-4.7-flash": (0.06, 0.40),
+    "@cf/deepseek-ai/deepseek-v4-flash-0731": (0.44, 1.32), "@cf/deepseek-ai/deepseek-v4-pro-0813": (1.32, 3.96),
+    "@cf/qwen/qwen3.8-27b": (0.45, 3.20), "@cf/nvidia/nemotron-3-120b-a12b": (0.50, 1.50),
+    "@cf/google/gemma-4-26b-a4b-it": (0.10, 0.30), "@cf/moonshotai/kimi-k2.7-code": (0.95, 4.00),
+}
 
 
 def client_from_env() -> AsyncOpenAI:
@@ -125,7 +141,7 @@ def make_tools(folder: Path) -> list:
 
 
 def seed(scenario: dict) -> Path:
-    folder = RUNS / f"{scenario['id']}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}"
+    folder = RUNS / f"{scenario['id']}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}"
     folder.mkdir(parents=True)
     for rel, content in (scenario.get("files") or {}).items():
         path = folder / rel
@@ -140,88 +156,93 @@ def usage_of(result) -> dict:
     return {"requests": u.requests, "input": u.input_tokens, "output": u.output_tokens, "total": u.total_tokens}
 
 
-async def turn(agent: Agent, task_input, max_turns: int) -> tuple[object | None, str, float]:
-    """One run of the agent: (result or None, status, seconds)."""
-    t0 = time.time()
-    try:
-        result = await Runner.run(agent, task_input, max_turns=max_turns)
-        return result, "done", round(time.time() - t0, 1)
-    except MaxTurnsExceeded:
-        return None, "max-turns", round(time.time() - t0, 1)
-    except Exception as e:  # noqa: BLE001 - the run's death is the result
-        return None, f"failed: {type(e).__name__}: {str(e)[:200]}", round(time.time() - t0, 1)
+def dollars(usage: dict | None, model_id: str) -> float:
+    if not usage or model_id not in PRICE:
+        return 0.0
+    pi, po = PRICE[model_id]
+    return (usage["input"] * pi + usage["output"] * po) / 1e6
+
+
+async def run_task(scenario: dict, args, client: AsyncOpenAI, sem: asyncio.Semaphore) -> dict:
+    """One task through the adapter: first turn, grade, optional follow-up, grade again."""
+    model = lambda short: OpenAIChatCompletionsModel(model=MODELS[short][0], openai_client=client)  # noqa: E731
+    async with sem:
+        folder = seed(scenario)
+        agent = Agent(name="worker", instructions=INSTRUCTIONS, model=model(args.model), tools=make_tools(folder))
+        events: list[dict] = []
+        xyb = Xybernetex(mode="enforce", preset="recommended", approvals=False, log=events.append,
+                         followups={"mode": "act" if args.verify_model else "observe"})
+        t0 = time.time()
+        report = await xyb.run(agent, scenario["prompt"], session_key=folder.name, max_turns=args.max_turns,
+                               followup_model=model(args.verify_model) if args.verify_model else None)
+        out = {"task": scenario["id"], "model": args.model, "folder": str(folder),
+               "at": datetime.now(timezone.utc).isoformat(), "seconds": round(time.time() - t0, 1)}
+        reply = report.result.final_output if report.result else None
+        grade = evaluate(scenario, folder, reply)
+        usage = usage_of(report.result) if report.result else None
+        out["first"] = {"status": report.status, "error": report.error, "seconds": report.seconds, "usage": usage,
+                        "dollars": round(dollars(usage, MODELS[args.model][0]), 5), "passed": grade.task,
+                        "detail": grade.detail, "reply": (reply or "")[-600:], "decision": report.decision,
+                        "gate": [{k: v for k, v in e.items() if k in ("type", "action", "authorization", "riskTier", "toolName")}
+                                 for e in events if e["type"].startswith("tool_gate") and e["type"] != "tool_gate_ready"]}
+        if report.followup is not None:
+            reply2 = report.followup.final_output
+            grade2 = evaluate(scenario, folder, reply2)
+            usage2 = usage_of(report.followup)
+            out["verify"] = {"model": args.verify_model, "usage": usage2, "passed": grade2.task, "detail": grade2.detail,
+                             "dollars": round(dollars(usage2, MODELS[args.verify_model][0]), 5), "reply": (reply2 or "")[-600:]}
+        RUNS.mkdir(parents=True, exist_ok=True)
+        with open(RUNS / "runs.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(out, default=str) + "\n")
+        f1, v = out["first"], out.get("verify")
+        print(f"{scenario['id']:<18} first {'PASS' if f1['passed'] else 'fail':<4} {f1['status']:<6} "
+              f"{(f1['usage'] or {}).get('total', 0):>7} tok ${f1['dollars']:.4f}"
+              + (f"   verify {'PASS' if v['passed'] else 'fail':<4} {v['usage']['total']:>7} tok ${v['dollars']:.4f}" if v else "")
+              + (f"   gate: {', '.join(e['action'] or e['type'] for e in f1['gate'])}" if f1["gate"] else ""), flush=True)
+        return out
 
 
 async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--task", default="hh-toposort", help="scenario id (scenarios/suite.py)")
+    parser.add_argument("--task", help="one scenario id (scenarios/suite.py)")
+    parser.add_argument("--category", help="every scenario in this category, e.g. hard2 or hard3")
     parser.add_argument("--model", default="glm53f", help=f"short name: {', '.join(MODELS)}")
-    parser.add_argument("--verify-model", help="run a check-your-work turn on this model afterwards")
-    parser.add_argument("--max-turns", type=int, default=40, help="tool-call rounds before the SDK stops the run")
-    parser.add_argument("--xybernetex", action="store_true",
-                        help="run through the xybernetex-python adapter (gate, deaths, follow-ups) instead of bare Runner.run; "
-                             "needs that package importable, e.g. PYTHONPATH=../xybernetex-python/src")
+    parser.add_argument("--verify-model", help="the adapter runs a check-your-work turn on this model afterwards")
+    parser.add_argument("--max-turns", type=int, default=40, help="tool-call rounds before the SDK stops a run")
+    parser.add_argument("--concurrency", type=int, default=2)
     args = parser.parse_args()
-    scenario = next((s for s in SCENARIOS if s["id"] == args.task), None)
-    if scenario is None:
-        sys.exit(f"unknown task {args.task!r}")
+    if args.task:
+        chosen = [s for s in SCENARIOS if s["id"] == args.task]
+    elif args.category:
+        chosen = [s for s in SCENARIOS if s["category"] == args.category]
+    else:
+        parser.error("--task or --category is required")
+    if not chosen:
+        sys.exit("no such task or category")
     for m in (args.model, args.verify_model):
         if m and m not in MODELS:
             sys.exit(f"unknown model {m!r}; known: {', '.join(MODELS)}")
 
     client = client_from_env()
     set_tracing_disabled(True)  # tracing would go to OpenAI, with the wrong key
-    folder = seed(scenario)
-    tools = make_tools(folder)
-    model = lambda short: OpenAIChatCompletionsModel(model=MODELS[short][0], openai_client=client)  # noqa: E731
-    out = {"task": scenario["id"], "model": args.model, "folder": str(folder)}
-    agent = Agent(name="worker", instructions=INSTRUCTIONS, model=model(args.model), tools=tools)
+    sem = asyncio.Semaphore(max(1, args.concurrency))
+    print(f"{len(chosen)} task(s) on {args.model}" + (f", check on {args.verify_model}" if args.verify_model else "")
+          + f", {args.concurrency} at a time", flush=True)
+    results = await asyncio.gather(*(run_task(s, args, client, sem) for s in chosen))
 
-    if args.xybernetex:
-        # The real product path: the gate on every tool call, death detection, and the
-        # follow-up decided and run by the adapter (xybernetex-python), graded here.
-        from xybernetex.openai_agents import Xybernetex
-        events = []
-        xyb = Xybernetex(mode="enforce", preset="recommended", approvals=False, log=events.append,
-                         followups={"mode": "act" if args.verify_model else "observe"})
-        report = await xyb.run(agent, scenario["prompt"], session_key=folder.name, max_turns=args.max_turns,
-                               followup_model=model(args.verify_model) if args.verify_model else None)
-        reply = report.result.final_output if report.result else None
-        grade = evaluate(scenario, folder, reply)
-        out["first"] = {"status": report.status, "error": report.error, "seconds": report.seconds,
-                        "usage": usage_of(report.result) if report.result else None, "passed": grade.task,
-                        "detail": grade.detail, "reply": (reply or "")[-600:], "decision": report.decision,
-                        "gate": [e for e in events if e["type"].startswith("tool_gate") and e["type"] != "tool_gate_ready"]}
-        print(json.dumps(out["first"], indent=1, default=str), flush=True)
-        if report.followup is not None:
-            reply2 = report.followup.final_output
-            grade2 = evaluate(scenario, folder, reply2)
-            out["verify"] = {"model": args.verify_model, "usage": usage_of(report.followup), "passed": grade2.task,
-                             "detail": grade2.detail, "reply": (reply2 or "")[-600:]}
-            print(json.dumps(out["verify"], indent=1, default=str), flush=True)
-    else:
-        result, status, seconds = await turn(agent, scenario["prompt"], args.max_turns)
-        reply = result.final_output if result else None
-        grade = evaluate(scenario, folder, reply)
-        out["first"] = {"status": status, "seconds": seconds, "usage": usage_of(result) if result else None,
-                        "passed": grade.task, "detail": grade.detail, "reply": (reply or "")[-600:]}
-        print(json.dumps(out["first"], indent=1), flush=True)
-
-        if args.verify_model and result:
-            checker = Agent(name="checker", instructions=INSTRUCTIONS, model=model(args.verify_model), tools=tools)
-            history = result.to_input_list() + [{"role": "user", "content": FOLLOW_UPS["verify"]}]
-            result2, status2, seconds2 = await turn(checker, history, args.max_turns)
-            reply2 = result2.final_output if result2 else reply
-            grade2 = evaluate(scenario, folder, reply2)
-            out["verify"] = {"model": args.verify_model, "status": status2, "seconds": seconds2,
-                             "usage": usage_of(result2) if result2 else None, "passed": grade2.task,
-                             "detail": grade2.detail, "reply": (reply2 or "")[-600:]}
-            print(json.dumps(out["verify"], indent=1), flush=True)
-
-    log = RUNS / "runs.jsonl"
-    with open(log, "a", encoding="utf-8") as f:
-        f.write(json.dumps({**out, "at": datetime.now(timezone.utc).isoformat()}) + "\n")
-    print(f"\nfolder: {folder}\nlog: {log}")
+    if len(results) > 1:
+        n = len(results)
+        first_pass = sum(1 for r in results if r["first"]["passed"])
+        first_cost = sum(r["first"]["dollars"] for r in results)
+        line = f"\n{n} tasks: first turn {first_pass}/{n} passed ({first_pass / n:.0%}), ${first_cost:.4f}"
+        if args.verify_model:
+            after = sum(1 for r in results if (r.get("verify") or r["first"])["passed"])
+            total = first_cost + sum((r.get("verify") or {}).get("dollars", 0) for r in results)
+            line += (f"; after the check {after}/{n} ({after / n:.0%}), ${total:.4f} total"
+                     f" = ${total / max(after, 1):.4f} per completed task (first turn alone: ${first_cost / max(first_pass, 1):.4f})")
+        blocked = sum(1 for r in results for e in r["first"]["gate"] if e["action"] == "BLOCK_ACTION")
+        print(line + f"; gate blocks: {blocked}", flush=True)
+    print(f"\nlog: {RUNS / 'runs.jsonl'}")
 
 
 if __name__ == "__main__":
