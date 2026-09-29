@@ -1,7 +1,8 @@
 """learn.uplift on synthetic counterfactual runs with known truth: exact
-scoring, the numpy learners, and that a learner using decision-time features
-beats every fixed rule when verification only pays on runs those features
-can spot - and doesn't when verification never pays."""
+scoring, the numpy learners, and that learners using decision-time features
+pick the right follow-up per run and beat every fixed rule when each
+follow-up pays in a different, visible niche - and claim nothing when no
+follow-up ever pays."""
 import json
 import random
 import tempfile
@@ -14,12 +15,14 @@ from learn import uplift
 from scenarios.cf_features import FEATURE_NAMES, features, split_turns, tokens
 
 MODELS = ["workers-ai/@cf/google/gemma-4-26b-a4b-it", "workers-ai/@cf/nvidia/nemotron-3-120b-a12b"]
+COST = {"verify-same": 40_000, "test-fresh": 60_000, "verify-strong": 150_000}
 
 
-def synth(n_tasks=12, per_task=40, seed=1, verify_pays=True) -> list[uplift.Run]:
-    """First answers are wrong more often when failed_calls is high; verify fixes
-    most wrong answers only when the run hedged (a visible signal) and costs
-    60k tokens every time."""
+def synth(n_tasks=12, per_task=40, seed=1, pays=True) -> list[uplift.Run]:
+    """Wrong first answers get likelier with failed calls. The test-writing
+    check fixes most wrong answers from runs that never claimed to check;
+    the same-session check fixes some from runs that hedged; the strong model
+    fixes more of any kind but costs far more."""
     rng = random.Random(seed)
     runs = []
     for t in range(n_tasks):
@@ -27,22 +30,25 @@ def synth(n_tasks=12, per_task=40, seed=1, verify_pays=True) -> list[uplift.Run]
             f = {k: 0.0 for k in FEATURE_NAMES}
             f["failed_calls"] = rng.randint(0, 6)
             f["hedges"] = float(rng.random() < 0.4)
-            f["tool_calls"] = rng.randint(3, 30)
+            f["claims_checked"] = float(rng.random() < 0.5)
             wrong = rng.random() < 0.15 + 0.1 * f["failed_calls"]
             y0 = 0.0 if wrong else 1.0
-            fixes = verify_pays and wrong and f["hedges"] and rng.random() < 0.8
-            y1 = 1.0 if (y0 or fixes) else 0.0
-            runs.append(uplift.Run(scenario=f"t{t}", model=rng.choice(MODELS), finished=True, y0=y0, y1=y1,
-                                   t0=100_000, t1=60_000, x=np.array([f[k] for k in FEATURE_NAMES])))
+            fixes = {"test-fresh": pays and wrong and not f["claims_checked"] and rng.random() < 0.8,
+                     "verify-same": pays and wrong and f["hedges"] and rng.random() < 0.5,
+                     "verify-strong": pays and wrong and rng.random() < 0.6}
+            runs.append(uplift.Run(scenario=f"t{t}", model=rng.choice(MODELS), kind="finished", y0=y0, t0=100_000,
+                                   x=np.array([f[k] for k in FEATURE_NAMES]),
+                                   arms={a: (1.0 if (y0 or fixes[a]) else 0.0, COST[a]) for a in COST}))
     return runs
 
 
 class ScoringTest(unittest.TestCase):
     def test_exact_scoring_uses_each_runs_own_outcome_under_the_chosen_action(self):
-        runs = [uplift.Run("a", "m", True, 0, 1, 100, 50, np.zeros(len(FEATURE_NAMES))),
-                uplift.Run("a", "m", True, 1, 1, 100, 50, np.zeros(len(FEATURE_NAMES)))]
-        never = uplift.score(runs, [False, False], lam=0.0)
-        both = uplift.score(runs, [True, True], lam=0.0)
+        z = np.zeros(len(FEATURE_NAMES))
+        runs = [uplift.Run("a", "m", "finished", 0, 100, z, {"v": (1, 50)}),
+                uplift.Run("a", "m", "finished", 1, 100, z, {"v": (1, 50)})]
+        never = uplift.score(runs, ["none", "none"], lam=0.0)
+        both = uplift.score(runs, ["v", "v"], lam=0.0)
         self.assertEqual((never["success"], never["tokens_per_success"]), (0.5, 200.0))
         self.assertEqual((both["success"], both["tokens_per_success"]), (1.0, 150.0))
 
@@ -58,30 +64,30 @@ class ScoringTest(unittest.TestCase):
 
 
 class LearningTest(unittest.TestCase):
-    def test_feature_learners_beat_every_fixed_rule_when_the_signal_is_visible(self):
+    def test_learners_pick_the_right_follow_up_per_run_and_beat_every_fixed_rule(self):
         runs = synth()
         dec = uplift.crossfit(runs, lam=0.05)
         util = {k: uplift.score(runs, v, 0.05)["utility"] for k, v in dec.items()}
-        best_fixed = max(util[k] for k in uplift.FIXED)
-        # The best any policy can do from the features: verify exactly the runs that hedged
-        # (skipping the rest saves 0.03 utility each; about 60% of runs, so at most ~+0.018).
-        oracle = uplift.score(runs, [bool(r.x[FEATURE_NAMES.index("hedges")]) for r in runs], 0.05)["utility"]
+        best_fixed = max(util[k] for k in uplift.fixed_names(runs))
         for k in ("uplift-tree", "uplift-logistic"):
-            self.assertGreater(util[k], best_fixed + 0.01, util)
-            self.assertGreater(util[k], oracle - 0.005, (k, util[k], oracle))
-        # Out of sample on new tasks too.
+            self.assertGreater(util[k], best_fixed + 0.015, util)
+        # It uses the test-writing check mostly where the run never claimed to check.
+        i_claims = FEATURE_NAMES.index("claims_checked")
+        test_picks = [r.x[i_claims] for r, a in zip(runs, dec["uplift-tree"]) if a == "test-fresh"]
+        self.assertLess(np.mean(test_picks), 0.2)
+        # And out of sample, on new tasks.
         test = synth(n_tasks=6, seed=9)
         pols = uplift.train_policies(runs, 0.05)
-        held = {k.split(" (")[0]: uplift.score(test, [bool(p(r)) for r in test], 0.05)["utility"] for k, p in pols.items()}
-        self.assertGreater(held["uplift-tree"], max(held[k] for k in uplift.FIXED))
+        held = {k: uplift.score(test, [p(r) for r in test], 0.05)["utility"] for k, p in pols.items()}
+        self.assertGreater(held["uplift-tree"], max(held[k] for k in uplift.fixed_names(runs)))
 
-    def test_no_learner_claims_a_win_when_verification_never_pays(self):
-        runs = synth(verify_pays=False)
+    def test_no_learner_claims_a_win_when_no_follow_up_ever_pays(self):
+        runs = synth(pays=False)
         dec = uplift.crossfit(runs, lam=0.05)
         util = {k: uplift.score(runs, v, 0.05)["utility"] for k, v in dec.items()}
-        self.assertEqual(max(util, key=util.get), "never")  # verifying only ever costs tokens
+        self.assertEqual(max(util, key=util.get), "never")  # every follow-up only costs tokens
         ci = uplift.bootstrap_gain(runs, dec, 0.05, rounds=200)
-        for k in ("uplift-tree", "uplift-logistic", "per-model"):
+        for k in ("uplift-tree", "uplift-logistic", "per-model", "failure-threshold"):
             self.assertLessEqual(ci[k][0], 0.0)  # no learned policy is confidently better
 
 
@@ -108,24 +114,27 @@ class CounterfactualDataTest(unittest.TestCase):
         self.assertEqual((f["hedges"], f["claims_checked"], f["ended_stop"], f["minutes"]), (1, 0, 1, 2.0))
         self.assertTrue(all(isinstance(v, (int, float)) for v in f.values()))
 
-    def test_load_reads_the_harness_manifest(self):
+    def test_load_reads_every_branch_and_skips_incomplete_runs(self):
         with tempfile.TemporaryDirectory() as d:
             feats = {k: 1 for k in FEATURE_NAMES}
+            ok = {"task": True, "tokens": 100}
             rows = [
                 {"session_key": "k1", "scenario": "hx-a", "model": "gemma4",
-                 "counterfactual": {"action": "verify", "before": {"task": False}, "after": {"task": True},
-                                    "features": feats, "tokens_first": 900, "tokens_follow_up": 100}},
+                 "counterfactual": {"kind": "finished", "before": {"task": False}, "features": feats, "tokens_first": 900,
+                                    "branches": {"verify-same": ok, "test-fresh": {"task": False, "tokens": 50}}}},
                 {"session_key": "k2", "scenario": "hx-a", "model": "gemma4",
-                 "counterfactual": {"action": None, "before": {"task": False}, "note": "timed out"}},
+                 "counterfactual": {"kind": None, "before": {"task": False}, "note": "timed out", "branches": {}}},
                 {"session_key": "k3", "scenario": "hx-b", "model": "nemo3",
-                 "counterfactual": {"action": "retry", "before": {"task": False}, "after": {"task": None},
-                                    "features": feats}},
+                 "counterfactual": {"kind": "died", "before": {"task": False}, "features": feats,
+                                    "branches": {"retry-same": ok, "retry-fresh": {"task": None, "error": "x"}}}},
             ]
             (Path(d) / "runs.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
             runs = uplift.load([Path(d)])
-        self.assertEqual(len(runs), 1)  # no follow-up, and an unverifiable grade, are left out
-        self.assertEqual((runs[0].y0, runs[0].y1, runs[0].t1), (0.0, 1.0, 100.0))
-        self.assertTrue(runs[0].model.endswith("gemma-4-26b-a4b-it"))
+        self.assertEqual(len(runs), 1)  # no follow-ups, and a branch without a grade, are left out
+        r = runs[0]
+        self.assertEqual((r.y0, r.arms["verify-same"], r.arms["test-fresh"]), (0.0, (1.0, 100.0), (0.0, 50.0)))
+        self.assertEqual(r.outcome("verify-same"), (1.0, 1000.0))
+        self.assertTrue(r.model.endswith("gemma-4-26b-a4b-it"))
 
 
 if __name__ == "__main__":

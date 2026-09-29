@@ -327,12 +327,75 @@ def _transcript(session_key: str, since: datetime) -> list[dict]:
         conn.close()
 
 
+# Counterfactual branches (levers 13-16): every follow-up starts from the same
+# point - the folder as the first turn left it. OpenClaw can't fork a session,
+# so only one branch can continue the run's own session ("-same", what the
+# plugin does); the rest run in a fresh session on their own copy of the
+# folder, with the task restated. "verify-fresh" is the control that separates
+# the fresh session from the wording ("test-fresh") and the model ("-strong").
+STRONG_MODEL = "dsv4p"  # best first-try success in the 2026-09-28 hard2 arms (10/10 with no follow-up)
+_EARLIER = ("An earlier session already worked on this task, and its work is in this folder. Don't start over.\n\n")
+BRANCH_PROMPTS = {
+    "verify": _EARLIER + "Check that work against the task:\n"
+              "1. Re-read the task and confirm every part of it is done.\n"
+              "2. For each file the task asks for, confirm it exists at the requested path with the expected content.\n"
+              "3. If the task involves a command's output or tests, run it and make sure the result matches.\n"
+              "4. Check the edge cases and exact formats the task mentions.\n"
+              "If anything is missing or wrong, fix it now. Then give your final answer.",
+    "test": _EARLIER + "Write a small test script that checks the work against the task's exact requirements - every "
+            "rule, edge case and output format it mentions - and run it. Fix whatever it shows is wrong or missing, and "
+            "run it again until it passes. Delete the test script afterwards unless the task asked for tests. Then give "
+            "your final answer.",
+    "retry": _EARLIER + "That session ended before the task was finished. Check what's already done, then finish the rest.",
+}
+FINISHED_BRANCHES = [  # name, prompt kind, model (None = the run's own), same session?
+    ("verify-same", "verify", None, True), ("verify-fresh", "verify", None, False),
+    ("test-fresh", "test", None, False), ("verify-strong", "verify", STRONG_MODEL, False),
+]
+DEAD_BRANCHES = [
+    ("retry-same", "retry", None, True), ("retry-fresh", "retry", None, False), ("retry-strong", "retry", STRONG_MODEL, False),
+]
+
+
+def _run_branch(job: dict, scenario: dict, oc: list[str], timeout: int, snapshot: Path, first_reply: str | None,
+                branch: tuple) -> dict:
+    """One follow-up from the snapshot; its grade, tokens and time. Never raises."""
+    from scenarios.cf_features import split_turns, tokens
+    from scenarios.outcomes import evaluate
+    name, kind, model, same = branch
+    t0 = time.time()
+    try:
+        if same:
+            bjob, folder = job, WORKSPACE / job["folder"]
+            message = FOLLOW_UPS["verify"] if kind == "verify" else FOLLOW_UPS["retry"]
+        else:
+            bjob = {**job, "session_key": f"{job['session_key']}-{name}", "folder": f"{job['folder']}.{name}",
+                    "model": model or job["model"]}
+            folder = WORKSPACE / bjob["folder"]
+            if folder.exists():
+                shutil.rmtree(folder, onexc=_clear_readonly_and_retry)
+            shutil.copytree(snapshot, folder)
+            message = FRAMING.format(folder=bjob["folder"], prompt=scenario["prompt"]) + "\n\n" + BRANCH_PROMPTS[kind]
+        status, _code, out, err = _agent_turn(bjob, oc, timeout, message)
+        reply = _reply_text(out)
+        grade = evaluate(scenario, folder, reply or (first_reply if same else None))
+        # A check that dies leaves the first answer standing; a retry that dies is still a failure.
+        task = grade.task if (status == "done" or kind != "retry") else False
+        msgs = _transcript(bjob["session_key"], datetime.fromtimestamp(t0, timezone.utc))
+        spent = tokens(split_turns(msgs)[1] if same else msgs)
+        return {"task": task, "graded": grade.task, "detail": grade.detail[:200], "status": status,
+                "model": bjob["model"], "tokens": spent, "seconds": round(time.time() - t0, 1),
+                "stderr_tail": err[-300:]}
+    except Exception as exc:  # noqa: BLE001 - one broken branch must not lose the run's other outcomes
+        return {"task": None, "error": f"{type(exc).__name__}: {exc}"[:300], "seconds": round(time.time() - t0, 1)}
+
+
 def _counterfactual(job: dict, scenario: dict, oc: list[str], timeout: int, result: dict, started: float) -> dict:
-    """Both outcomes of one run (scenarios/cf_features.py): grade the folder as
-    the first turn left it - a copy, so the follow-up can't touch it - then
-    send the follow-up in the same session (verify if the run finished, retry
-    if it died) and grade the folder again. A run the harness timed out gets
-    neither: its run may still be going inside the gateway."""
+    """Every outcome of one run (scenarios/cf_features.py): grade the folder as
+    the first turn left it (a copy, which the follow-ups can't touch), then run
+    each follow-up branch from that same point, in parallel, and grade each. A
+    run the harness timed out gets none: its run may still be going inside
+    the gateway."""
     from scenarios.cf_features import features, split_turns, tokens
     from scenarios.outcomes import evaluate
     folder = WORKSPACE / job["folder"]
@@ -344,27 +407,23 @@ def _counterfactual(job: dict, scenario: dict, oc: list[str], timeout: int, resu
     b = evaluate(scenario, snapshot, first_reply)
     # A run that died gave the user no answer, whatever is on disk.
     cf = {"before": {"task": b.task if status == "done" else False, "graded": b.task, "detail": b.detail[:200]},
-          "action": None, "after": None}
-    if status in ("done", "failed"):
-        action = "verify" if status == "done" else "retry"
-        t1 = time.time()
-        f_status, _code, f_out, f_err = _agent_turn(job, oc, timeout, FOLLOW_UPS[action])
-        f_reply = _reply_text(f_out)
-        a = evaluate(scenario, folder, f_reply or first_reply)
-        # A verify turn that dies leaves the first answer standing; a retry that dies is still a failure.
-        after = a.task if (f_status == "done" or action == "verify") else False
-        cf.update(action=action, follow_up_status=f_status, follow_up_seconds=round(time.time() - t1, 1),
-                  after={"task": after, "graded": a.task, "detail": a.detail[:200]},
-                  follow_up_stderr_tail=f_err[-500:])
-        if f_reply:
-            result["reply"] = f_reply
-    else:
-        cf["note"] = f"first turn {status}: no follow-up"
+          "kind": None, "branches": {}}
     try:
-        first, follow = split_turns(_transcript(job["session_key"], datetime.fromtimestamp(started, timezone.utc)))
-        cf.update(features=features(first), tokens_first=tokens(first), tokens_follow_up=tokens(follow))
+        first, _ = split_turns(_transcript(job["session_key"], datetime.fromtimestamp(started, timezone.utc)))
+        cf.update(features=features(first), tokens_first=tokens(first))
     except Exception as exc:  # noqa: BLE001 - features are extra; the grades are the data
         cf["features_error"] = f"{type(exc).__name__}: {exc}"[:200]
+    if status not in ("done", "failed"):
+        cf["note"] = f"first turn {status}: no follow-up"
+        return cf
+    cf["kind"] = "finished" if status == "done" else "died"
+    branches = FINISHED_BRANCHES if status == "done" else DEAD_BRANCHES
+    todo = [br for br in branches if not (br[2] and br[2] == job["model"])]  # "-strong" on the strong model = "-fresh"
+    with ThreadPoolExecutor(max_workers=len(todo)) as pool:
+        outs = dict(zip([br[0] for br in todo],
+                        pool.map(lambda br: _run_branch(job, scenario, oc, timeout, snapshot, first_reply, br), todo)))
+    for name, _kind, model, _same in branches:
+        cf["branches"][name] = outs.get(name) or {**outs[name.replace("-strong", "-fresh")], "alias": name.replace("-strong", "-fresh")}
     return cf
 
 
@@ -469,8 +528,9 @@ def main() -> None:
     parser.add_argument("--follow-up", choices=["verify"],
                         help="send this follow-up turn, in the same session, after every run that finishes")
     parser.add_argument("--counterfactual", action="store_true",
-                        help="grade each run before and after a harness follow-up (verify if it finished, retry if it "
-                             "died), recording both outcomes and decision-time features (scenarios/cf_features.py)")
+                        help="grade each run as its first turn left it, then run every follow-up branch from that point "
+                             "(verify same/fresh session, test-writing check, verify on the strong model; retries for "
+                             "dead runs) and grade each - all outcomes of the same run, plus decision-time features")
     parser.add_argument("--await-interventions", action="store_true",
                         help="after each run, wait for the plugin's intervention decision and any follow-up turn it started")
     parser.add_argument("--dry-run", action="store_true")
