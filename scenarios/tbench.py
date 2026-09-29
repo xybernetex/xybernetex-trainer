@@ -151,12 +151,19 @@ def agent_image(task: Task) -> str:
     return tag
 
 
-def openclaw_config(model_id: str, extra_models: tuple[str, ...] = ()) -> str:
+def openclaw_config(model_id: str, extra_models: tuple[str, ...] = (), max_tokens: int | None = None) -> str:
     """A minimal container config from the host's: the Workers AI provider (with its
     key - written into the container only), the run's model (plus any a branch
-    switches to), exec without prompts."""
+    switches to), exec without prompts. max_tokens overrides the output cap for
+    the run's models (the host sets 8192; every length-stopped message in the
+    2026-09 experiments stopped at exactly that, and OpenClaw then substitutes
+    its fallback reply - the commonest death)."""
     host = json.loads((Path.home() / ".openclaw" / "openclaw.json").read_text(encoding="utf-8"))
-    provider = host["models"]["providers"][PROVIDER]
+    provider = json.loads(json.dumps(host["models"]["providers"][PROVIDER]))  # a copy: the host config isn't ours to change
+    if max_tokens:
+        for m in provider.get("models", []):
+            if m.get("id") in (model_id, *extra_models):
+                m["maxTokens"] = max_tokens
     ref = f"{PROVIDER}/{model_id}"
     return json.dumps({
         "models": {"providers": {PROVIDER: provider}},
@@ -332,14 +339,14 @@ def task_message(task: Task, wd: str) -> str:
             f"reasonable assumptions and finish.\n\nTask: {task.instruction}")
 
 
-def start_agent(task: Task, model_id: str, turn_timeout: int,
-                extra_models: tuple[str, ...] = ()) -> tuple[Container, dict]:
+def start_agent(task: Task, model_id: str, turn_timeout: int, extra_models: tuple[str, ...] = (),
+                max_tokens: int | None = None) -> tuple[Container, dict]:
     """A configured container of the agent image, after the task's first turn."""
     image = agent_image(task)
     wd = task.workdir(image)
     c = Container(image, task.memory_mb, wd)
     try:
-        c.put(openclaw_config(model_id, extra_models), "/root/.openclaw/openclaw.json")
+        c.put(openclaw_config(model_id, extra_models, max_tokens), "/root/.openclaw/openclaw.json")
         c.exec(f"mkdir -p {OC_WORKSPACE}", 60, workdir="/")
         return c, agent_turn(c, model_id, SESSION, task_message(task, wd), min(task.agent_timeout, turn_timeout))
     except BaseException:
@@ -353,14 +360,16 @@ def drop_images(task: Task) -> None:
         sh(["docker", "rmi", "-f", tag], check=False)
 
 
-def survey_task(task: Task, model_id: str, turn_timeout: int) -> dict:
+def survey_task(task: Task, model_id: str, turn_timeout: int, max_tokens: int | None = None) -> dict:
     """Grader check, then one first turn: does the model solve it on its own?"""
     rec = {"task": task.rel, "model": model_id, "started": datetime.now(timezone.utc).isoformat()}
+    if max_tokens:
+        rec["max_tokens"] = max_tokens
     try:
         rec["grader"] = validate(task)
         if not rec["grader"]["valid"]:
             return rec
-        c, turn = start_agent(task, model_id, turn_timeout)
+        c, turn = start_agent(task, model_id, turn_timeout, max_tokens=max_tokens)
         try:
             from scenarios.cf_features import features, tokens
             msgs = transcript(c)
@@ -379,19 +388,21 @@ def survey_task(task: Task, model_id: str, turn_timeout: int) -> dict:
     return rec
 
 
-def survey(model_id: str, concurrency: int, turn_timeout: int, only: list[str] | None = None) -> None:
-    """Every candidate task once. Resumable: tasks already surveyed without an error are skipped."""
+def survey(model_id: str, concurrency: int, turn_timeout: int, only: list[str] | None = None,
+           max_tokens: int | None = None) -> None:
+    """Every candidate task once. Resumable: tasks already surveyed without an error are
+    skipped. A max_tokens override gets its own log, so it never stands in for the baseline."""
     SURVEY_DIR.mkdir(parents=True, exist_ok=True)
-    log = SURVEY_DIR / "survey.jsonl"
+    log = SURVEY_DIR / (f"survey-max{max_tokens}.jsonl" if max_tokens else "survey.jsonl")
     done = set()
     if log.exists():
         done = {(r["task"], r["model"]) for r in map(json.loads, log.read_text(encoding="utf-8").splitlines())
                 if "error" not in r}
     todo = [t for t in (only or candidates()) if (t, model_id) not in done]
-    print(f"{len(todo)} tasks to survey ({len(done)} done)", flush=True)
+    print(f"{len(todo)} tasks to survey ({len(done)} done)" + (f", max_tokens={max_tokens}" if max_tokens else ""), flush=True)
     ensure_runtime()
     with ThreadPoolExecutor(concurrency) as pool:
-        futures = [pool.submit(survey_task, Task(t), model_id, turn_timeout) for t in todo]
+        futures = [pool.submit(survey_task, Task(t), model_id, turn_timeout, max_tokens) for t in todo]
         for i, f in enumerate(as_completed(futures), 1):
             rec = f.result()
             with open(log, "a", encoding="utf-8") as fh:
@@ -573,6 +584,7 @@ def main() -> None:
     parser.add_argument("--reps", type=int, default=1)
     parser.add_argument("--concurrency", type=int, default=3)
     parser.add_argument("--turn-timeout", type=int, default=900)
+    parser.add_argument("--max-tokens", type=int, help="survey: override the models' output cap (host default 8192)")
     args = parser.parse_args()
     from scenarios.run_suite import MODELS
     if args.command == "cf":
@@ -589,7 +601,8 @@ def main() -> None:
     if args.command == "list":
         print("\n".join(candidates()))
     elif args.command == "survey":
-        survey(model_id, args.concurrency, args.turn_timeout, args.task.split(",") if args.task else None)
+        survey(model_id, args.concurrency, args.turn_timeout, args.task.split(",") if args.task else None,
+               args.max_tokens)
     elif not args.task:
         parser.error("--task is required")
     elif args.command == "validate":
