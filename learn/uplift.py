@@ -75,7 +75,7 @@ def load(batch_dirs: list[Path]) -> list[Run]:
         for line in (d / "runs.jsonl").read_text(encoding="utf-8").splitlines():
             if line.strip():
                 j = json.loads(line)
-                latest[j["session_key"]] = j
+                latest[j.get("base_key", j["session_key"])] = j
         for j in latest.values():
             cf = j.get("counterfactual") or {}
             branches, feats = cf.get("branches") or {}, cf.get("features")

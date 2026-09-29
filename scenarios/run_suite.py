@@ -468,6 +468,26 @@ def _run_job_unsafe(job: dict, scenario: dict, oc: list[str], timeout: int, foll
     return result
 
 
+def _fresh_attempt(job: dict) -> dict:
+    """OpenClaw keeps a session's history under its key, so a job re-run after a
+    crash (or with --retry-failed) under the same key would continue its earlier
+    attempt's conversation. A re-run takes the first attempt key with no session
+    yet - its own and its branches' - and records the job's key as base_key,
+    which is what resume and the manifest readers match on."""
+    import sqlite3
+    from scenarios.outcomes import SESSION_DB
+    conn = sqlite3.connect(f"file:{SESSION_DB}?mode=ro", uri=True)
+    try:
+        base, key, n = job["session_key"], job["session_key"], 1
+        while conn.execute("select 1 from session_windows where session_key = ? or session_key like ? limit 1",
+                           (key, key + "-%")).fetchone():
+            n += 1
+            key = f"{base}-a{n}"
+    finally:
+        conn.close()
+    return job if n == 1 else {**job, "session_key": key, "base_key": base}
+
+
 def run(args) -> None:
     validate()
     batch_dir = BATCH_DIR / args.batch
@@ -478,8 +498,8 @@ def run(args) -> None:
         for line in manifest.read_text(encoding="utf-8").splitlines():
             entry = json.loads(line)
             if entry["status"] == "done" or not args.retry_failed:
-                done.add(entry["session_key"])
-    jobs = [j for j in _jobs(args) if j["session_key"] not in done]
+                done.add(entry.get("base_key", entry["session_key"]))
+    jobs = [_fresh_attempt(j) for j in _jobs(args) if j["session_key"] not in done]
     meta_path = batch_dir / "batch.json"
     if not meta_path.exists():
         meta_path.write_text(json.dumps({

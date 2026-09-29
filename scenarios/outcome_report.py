@@ -31,7 +31,7 @@ def latest_jobs(batch_dir: Path) -> list[dict]:
     for line in (batch_dir / "runs.jsonl").read_text(encoding="utf-8").splitlines():
         if line.strip():
             job = json.loads(line)
-            latest[job["session_key"]] = job
+            latest[job.get("base_key", job["session_key"])] = job
     return list(latest.values())
 
 

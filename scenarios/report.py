@@ -113,7 +113,7 @@ def build_report(batch_dir, log_path):
                 job = json.loads(line)
                 # Last recorded attempt wins; earlier successful/failed steps
                 # are excluded by its started timestamp in score_job.
-                jobs[job["session_key"]] = job
+                jobs[job.get("base_key", job["session_key"])] = job
     runs = load_runs(log_path)
     scenarios = by_id()
     rows = [score_job(job, runs, scenarios[job["scenario"]]) for job in jobs.values()]

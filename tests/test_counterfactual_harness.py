@@ -89,3 +89,27 @@ class HarnessTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FreshAttemptTest(unittest.TestCase):
+    """A job re-run after a crash must not continue its earlier attempt's session."""
+
+    def test_rerun_takes_first_unused_attempt_key(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "sessions.sqlite"
+            conn = sqlite3.connect(db)
+            conn.execute("create table session_windows (session_id text, session_key text)")
+            conn.executemany("insert into session_windows values (?, ?)", [
+                ("s1", "agent:scenarios:scn-b-x-m-r1"), ("s2", "agent:scenarios:scn-b-x-m-r1-a2-verify-fresh"),
+                ("s3", "agent:scenarios:scn-b-y-m-r1-retry-fresh")])
+            conn.commit()
+            conn.close()
+            with mock.patch("scenarios.outcomes.SESSION_DB", db):
+                fresh = rs._fresh_attempt({"session_key": "agent:scenarios:scn-b-z-m-r1"})
+                crashed = rs._fresh_attempt({"session_key": "agent:scenarios:scn-b-x-m-r1"})
+                branch_only = rs._fresh_attempt({"session_key": "agent:scenarios:scn-b-y-m-r1"})
+        self.assertEqual(fresh, {"session_key": "agent:scenarios:scn-b-z-m-r1"})
+        self.assertEqual(crashed, {"session_key": "agent:scenarios:scn-b-x-m-r1-a3",
+                                   "base_key": "agent:scenarios:scn-b-x-m-r1"})
+        self.assertEqual(branch_only["session_key"], "agent:scenarios:scn-b-y-m-r1-a2")
