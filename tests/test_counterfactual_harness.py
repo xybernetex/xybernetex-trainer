@@ -41,7 +41,8 @@ class HarnessTest(unittest.TestCase):
             return SimpleNamespace(task=text.count("+") == 1 and "same" not in text, detail=text)
 
         with mock.patch.object(rs, "WORKSPACE", self.ws), mock.patch.object(rs, "_agent_turn", agent_turn), \
-                mock.patch("scenarios.outcomes.evaluate", evaluate), mock.patch.object(rs, "_transcript", lambda k, s: []):
+                mock.patch("scenarios.outcomes.evaluate", evaluate), mock.patch.object(
+                    rs, "_transcript", lambda k, s: [{"role": "assistant", "usage": {"totalTokens": 111}}]):
             return rs._counterfactual(job, {"prompt": "do x"}, [], 60, {"status": status, "reply": "hi"}, 0.0), folder
 
     def test_finished_run_every_branch_from_the_same_snapshot(self):
@@ -63,6 +64,10 @@ class HarnessTest(unittest.TestCase):
         # The same-session branch works in the run's own folder (as the plugin's follow-up does).
         self.assertEqual((folder / "out.txt").read_text(encoding="utf-8"), "first answer + r1")
         self.assertEqual(cf["branches"]["verify-same"]["model"], "gemma4")
+        # Every branch is charged its own follow-up's tokens - the same-session one included
+        # (it once came out 0: the since-start transcript has no second user message to split at).
+        self.assertEqual({n: b["tokens"] for n, b in cf["branches"].items()},
+                         {"verify-same": 111, "verify-fresh": 111, "test-fresh": 111, "verify-strong": 111})
 
     def test_the_strong_branch_on_the_strong_model_reuses_the_fresh_one(self):
         cf, _ = self._run(model=rs.STRONG_MODEL)

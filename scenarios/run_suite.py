@@ -360,7 +360,7 @@ DEAD_BRANCHES = [
 def _run_branch(job: dict, scenario: dict, oc: list[str], timeout: int, snapshot: Path, first_reply: str | None,
                 branch: tuple) -> dict:
     """One follow-up from the snapshot; its grade, tokens and time. Never raises."""
-    from scenarios.cf_features import split_turns, tokens
+    from scenarios.cf_features import tokens
     from scenarios.outcomes import evaluate
     name, kind, model, same = branch
     t0 = time.time()
@@ -381,8 +381,8 @@ def _run_branch(job: dict, scenario: dict, oc: list[str], timeout: int, snapshot
         grade = evaluate(scenario, folder, reply or (first_reply if same else None))
         # A check that dies leaves the first answer standing; a retry that dies is still a failure.
         task = grade.task if (status == "done" or kind != "retry") else False
-        msgs = _transcript(bjob["session_key"], datetime.fromtimestamp(t0, timezone.utc))
-        spent = tokens(split_turns(msgs)[1] if same else msgs)
+        # Messages since this branch started are exactly the follow-up's, in either kind of session.
+        spent = tokens(_transcript(bjob["session_key"], datetime.fromtimestamp(t0, timezone.utc)))
         return {"task": task, "graded": grade.task, "detail": grade.detail[:200], "status": status,
                 "model": bjob["model"], "tokens": spent, "seconds": round(time.time() - t0, 1),
                 "stderr_tail": err[-300:]}
