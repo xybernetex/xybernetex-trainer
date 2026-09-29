@@ -31,6 +31,7 @@ we only score interventions on them and never publish task content.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import posixpath
 import shlex
@@ -373,9 +374,13 @@ def survey_task(task: Task, model_id: str, turn_timeout: int, max_tokens: int | 
         try:
             from scenarios.cf_features import features, tokens
             msgs = transcript(c)
+            replies = [m for m in msgs if m.get("role") == "assistant"]
             rec["first"] = {"status": turn["status"], "exit": turn["exit"], "seconds": turn["seconds"],
                             **run_summary(turn["stdout"]),
-                            "tokens": tokens(msgs), "features": features(msgs)}
+                            "tokens": tokens(msgs), "features": features(msgs),
+                            # Whether the output cap was hit: stop reasons per reply and the largest single output.
+                            "stops": dict(Counter(str(m.get("stopReason")) for m in replies)),
+                            "max_output": max((int((m.get("usage") or {}).get("output") or 0) for m in replies), default=0)}
             if turn["exit"] != 0:
                 rec["first"]["stderr_tail"] = turn["stderr_tail"]
             rec["reward"] = grade(task, c)["reward"]
