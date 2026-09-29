@@ -139,3 +139,18 @@ class CounterfactualDataTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConstantLabelsTest(unittest.TestCase):
+    """A fold where an action never fixed a run used to crash with a singular Hessian."""
+
+    def test_constant_labels_give_a_finite_base_rate(self):
+        import numpy as np
+        from learn.uplift import fit_logistic, predict_logistic
+        X = np.random.default_rng(0).normal(size=(12, 4))
+        for y in (np.zeros(12), np.ones(12)):
+            w = fit_logistic(X, y)
+            p = predict_logistic(w, X)
+            self.assertTrue(np.all(np.isfinite(w)))
+            self.assertTrue(np.allclose(p, p[0]))
+            self.assertTrue(0 < p[0] < 1)

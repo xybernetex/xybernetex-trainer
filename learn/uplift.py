@@ -121,8 +121,15 @@ def fit_logistic(X: np.ndarray, y: np.ndarray, ridge: float = 1.0, iters: int = 
     """L2-penalized logistic regression by Newton's method; returns weights with a bias first."""
     Xb = np.hstack([np.ones((len(X), 1)), X])
     w = np.zeros(Xb.shape[1])
+    # Labels that never vary (in a fold, no run an action ever fixed) drive
+    # the unpenalized bias to infinity and the Hessian singular: predict the
+    # smoothed base rate instead.
+    if len(y) == 0 or y.min() == y.max():
+        rate = (float(y.sum()) + 0.5) / (len(y) + 1.0)
+        w[0] = np.log(rate / (1 - rate))
+        return w
     pen = np.eye(Xb.shape[1]) * ridge
-    pen[0, 0] = 0
+    pen[0, 0] = 1e-6  # all but unpenalized; keeps H invertible when p saturates
     for _ in range(iters):
         p = 1 / (1 + np.exp(-Xb @ w))
         g = Xb.T @ (p - y) + pen @ w
