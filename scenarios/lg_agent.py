@@ -42,7 +42,7 @@ except ImportError:  # pragma: no cover
 from scenarios.outcomes import evaluate
 from scenarios.run_suite import MODELS
 from scenarios.sdk_agent import (INSTRUCTIONS, OUTPUT_LIMIT, RUNS, Sandbox, dollars, gate_summary, line_for, seed,
-                                 summary)
+                                 summary, unusable)
 from scenarios.suite import SCENARIOS
 
 
@@ -50,7 +50,7 @@ def chat_model(short: str) -> ChatOpenAI:
     account, key = os.environ.get("CF_ACCOUNT_ID"), os.environ.get("CF_WORKERS_AI_KEY")
     if not account or not key:
         sys.exit("set CF_ACCOUNT_ID and CF_WORKERS_AI_KEY in the environment (never in this file)")
-    return ChatOpenAI(model=MODELS[short][0], api_key=key, timeout=300, max_retries=1,
+    return ChatOpenAI(model=MODELS[short][0], api_key=key, timeout=300, max_retries=10,  # 429s: wait and retry
                       base_url=f"https://api.cloudflare.com/client/v4/accounts/{account}/ai/v1")
 
 
@@ -224,7 +224,7 @@ async def main() -> None:
     done: list[dict] = []
     if args.batch and (RUNS / "runs.jsonl").is_file():
         with open(RUNS / "runs.jsonl", encoding="utf-8") as f:
-            done = [r for r in map(json.loads, f) if r.get("batch") == args.batch and "crash" not in r]
+            done = [r for r in map(json.loads, f) if r.get("batch") == args.batch and not unusable(r)]
         finished = {r["task"] for r in done}
         chosen = [s for s in chosen if s["id"] not in finished]
         if done:

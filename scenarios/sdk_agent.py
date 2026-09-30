@@ -78,7 +78,21 @@ def client_from_env() -> AsyncOpenAI:
     account, key = os.environ.get("CF_ACCOUNT_ID"), os.environ.get("CF_WORKERS_AI_KEY")
     if not account or not key:
         sys.exit("set CF_ACCOUNT_ID and CF_WORKERS_AI_KEY in the environment (never in this file)")
-    return AsyncOpenAI(base_url=f"https://api.cloudflare.com/client/v4/accounts/{account}/ai/v1", api_key=key)
+    # Workers AI rate-limits requests per minute per model (429): the client waits
+    # (honoring retry-after) and retries rather than failing the run.
+    return AsyncOpenAI(base_url=f"https://api.cloudflare.com/client/v4/accounts/{account}/ai/v1", api_key=key,
+                       max_retries=10)
+
+
+# Failures of our setup, not of the task: a rate limit or a lost connection
+# says nothing about the model or the framework. Such runs are left out of the
+# summary and re-run by the next --batch invocation, like crashes.
+INFRA_ERRORS = ("RateLimitError", "Error code: 429", "rate limiting", "APIConnectionError")
+
+
+def unusable(r: dict) -> bool:
+    error = str(((r.get("first") or {}).get("error")) or "")
+    return "crash" in r or any(e in error for e in INFRA_ERRORS)
 
 
 class Sandbox:
@@ -247,7 +261,9 @@ async def run_task(scenario: dict, args, client: AsyncOpenAI, sem: asyncio.Semap
 
 
 def line_for(r: dict) -> str:
-    if "crash" in r:
+    if "crash" in r or unusable(r):
+        if "crash" not in r:
+            return f"{r['task']:<18} INFRA {r['first']['error'][:100]}"
         return f"{r['task']:<18} CRASH {r['crash'][:100]}"
     f1, v = r["first"], r.get("verify")
     return (f"{r['task']:<18} first {'PASS' if f1['passed'] else 'fail':<4} {f1['status']:<6} "
@@ -258,7 +274,7 @@ def line_for(r: dict) -> str:
 
 
 def summary(results: list[dict], verify: bool) -> str:
-    ran = [r for r in results if "crash" not in r]
+    ran = [r for r in results if not unusable(r)]
     n = len(ran)
     first_pass = sum(1 for r in ran if r["first"]["passed"])
     first_cost = sum(r["first"]["dollars"] for r in ran)
@@ -270,7 +286,8 @@ def summary(results: list[dict], verify: bool) -> str:
                  f" = ${total / max(after, 1):.4f} per completed task (first turn alone: ${first_cost / max(first_pass, 1):.4f})")
     blocked = sum(1 for r in ran for e in r["first"]["gate"] if e.get("action") == "BLOCK_ACTION")
     crashed = len(results) - n
-    return line + f"; gate blocks: {blocked}" + (f"; crashed: {crashed} (rerun the same command to retry them)" if crashed else "")
+    return line + f"; gate blocks: {blocked}" + (f"; crashed or rate-limited: {crashed} (rerun the same command to retry them)"
+                                                   if crashed else "")
 
 
 async def main() -> None:
@@ -298,7 +315,7 @@ async def main() -> None:
     done: list[dict] = []
     if args.batch and (RUNS / "runs.jsonl").is_file():
         with open(RUNS / "runs.jsonl", encoding="utf-8") as f:
-            done = [r for r in map(json.loads, f) if r.get("batch") == args.batch and "crash" not in r]
+            done = [r for r in map(json.loads, f) if r.get("batch") == args.batch and not unusable(r)]
         finished = {r["task"] for r in done}
         chosen = [s for s in chosen if s["id"] not in finished]
         if done:
