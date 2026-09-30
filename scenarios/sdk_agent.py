@@ -196,7 +196,7 @@ def dollars(usage: dict | None, model_id: str) -> float:
 
 
 def gate_summary(events: list[dict]) -> list[dict]:
-    return [{k: e[k] for k in ("type", "action", "authorization", "riskTier", "toolName") if k in e}
+    return [{k: e[k] for k in ("type", "action", "authorization", "waiver", "riskTier", "toolName") if k in e}
             for e in events if e["type"].startswith("tool_gate") and e["type"] != "tool_gate_ready"]
 
 
