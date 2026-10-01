@@ -113,6 +113,21 @@ class Sandbox:
             return 124, ""
         return p.returncode, p.stdout + ("\n[stderr]\n" + p.stderr if p.stderr.strip() else "")
 
+    def check(self, command: str, timeout: int) -> tuple[int, str]:
+        """A contract check, run on a throwaway copy of the folder so it can't change the work."""
+        setup = subprocess.run(["docker", "exec", "-w", "/", self.id, "bash", "-c",
+                                "rm -rf /tmp/xyb-check && cp -a /workspace /tmp/xyb-check"],
+                               capture_output=True, text=True, timeout=120)
+        if setup.returncode != 0:
+            raise RuntimeError(f"couldn't copy the folder for checking: {setup.stderr[-200:]}")
+        try:
+            p = subprocess.run(["docker", "exec", "-w", "/tmp/xyb-check", self.id, "timeout", str(timeout), "bash", "-c",
+                                command], capture_output=True, text=True, encoding="utf-8", errors="replace",
+                               timeout=timeout + 30)
+        except subprocess.TimeoutExpired:
+            return 124, ""
+        return p.returncode, p.stdout + ("\n[stderr]\n" + p.stderr if p.stderr.strip() else "")
+
     def close(self) -> None:
         subprocess.run(["docker", "rm", "-f", self.id], capture_output=True)
 
@@ -229,14 +244,21 @@ async def run_task(scenario: dict, args, client: AsyncOpenAI, sem: asyncio.Semap
                               tools=make_tools(folder, sandbox))
                 events: list[dict] = []
                 xyb = Xybernetex(mode="enforce", preset="recommended", approvals=False, log=events.append,
-                                 followups={"mode": "act" if args.verify_model else "observe"})
+                                 followups={"mode": "act" if args.verify_model or args.contract else "observe"})
+                first: dict = {}
+
+                async def grade_first(rep):
+                    # Graded here, before any check or follow-up can change the folder.
+                    first["reply"] = rep.result.final_output if rep.result else None
+                    first["grade"] = await asyncio.to_thread(evaluate, scenario, folder, first["reply"])
                 report = await xyb.run(agent, scenario["prompt"], session_key=folder.name, max_turns=args.max_turns,
-                                       followup_model=model(args.verify_model) if args.verify_model else None)
+                                       followup_model=model(args.verify_model) if args.verify_model else None,
+                                       contract=args.contract, run_checks=sandbox.check if args.contract else None,
+                                       max_fixes=args.max_fixes, after_first=grade_first)
             finally:
                 await asyncio.to_thread(sandbox.close)
             out["seconds"] = round(time.time() - t0, 1)
-            reply = report.result.final_output if report.result else None
-            grade = await asyncio.to_thread(evaluate, scenario, folder, reply)
+            reply, grade = first["reply"], first["grade"]
             usage = usage_of(report.result) if report.result else None
             out["first"] = {"status": report.status, "error": report.error, "seconds": report.seconds, "usage": usage,
                             "dollars": round(dollars(usage, MODELS[args.model][0]), 5), "passed": grade.task,
@@ -246,9 +268,13 @@ async def run_task(scenario: dict, args, client: AsyncOpenAI, sem: asyncio.Semap
                 reply2 = report.followup.final_output
                 grade2 = await asyncio.to_thread(evaluate, scenario, folder, reply2)
                 usage2 = usage_of(report.followup)
-                out["verify"] = {"model": args.verify_model, "usage": usage2, "passed": grade2.task, "detail": grade2.detail,
-                                 "dollars": round(dollars(usage2, MODELS[args.verify_model][0]), 5),
+                follow_model = args.verify_model or args.model
+                out["verify"] = {"model": follow_model, "action": (report.decision or {}).get("rule"), "usage": usage2,
+                                 "passed": grade2.task, "detail": grade2.detail,
+                                 "dollars": round(dollars(usage2, MODELS[follow_model][0]), 5),
                                  "reply": (reply2 or "")[-600:]}
+            if args.contract:
+                out["contract"] = contract_record(report, args.model)
         except Exception as e:  # noqa: BLE001 - one task's crash is a result, not the end of the batch
             out["seconds"] = round(time.time() - t0, 1)
             out["crash"] = f"{type(e).__name__}: {e}"[:300]
@@ -258,6 +284,19 @@ async def run_task(scenario: dict, args, client: AsyncOpenAI, sem: asyncio.Semap
             f.write(json.dumps(out, default=str) + "\n")
         print(line_for(out), flush=True)
         return out
+
+
+def contract_record(report, model_short: str) -> dict:
+    """What the contract arm did: the contract, every check round, and what writing it cost."""
+    c = report.contract
+    tokens = report.contract_tokens or 0
+    _, _, out_price = PRICE.get(MODELS[model_short][0], (0, 0, 0))
+    return {"available": c is not None, "source": c.source if c else None, "checks": len(c.checks) if c else 0,
+            "refused": len(c.refused) if c else 0, "hash": c.hash if c else None, "tokens": tokens,
+            # Usage for the one writing call isn't split into input and output: priced at the
+            # output rate, an upper bound.
+            "dollars": round(tokens * out_price / 1e6, 5),
+            "rounds": [v.summary() for v in report.verdicts], "met": report.contract_met}
 
 
 def line_for(r: dict) -> str:
@@ -270,6 +309,8 @@ def line_for(r: dict) -> str:
             f"{(f1['usage'] or {}).get('total', 0):>7} tok ${f1['dollars']:.4f}"
             + (f"   verify {'PASS' if v['passed'] else 'fail':<4} {v['usage']['total']:>7} tok ${v['dollars']:.4f}" if v else "")
             + (f"   gate: {', '.join(e.get('action') or e['type'] for e in f1['gate'])}" if f1["gate"] else "")
+            + (f"   contract: {'none' if not r['contract']['available'] else 'met' if r['contract']['met'] else 'FAILED'}"
+               if r.get("contract") else "")
             + f"   {r['seconds']:.0f}s")
 
 
@@ -281,7 +322,8 @@ def summary(results: list[dict], verify: bool) -> str:
     line = f"\n{n} tasks: first turn {first_pass}/{n} passed ({first_pass / max(n, 1):.0%}), ${first_cost:.4f}"
     if verify:
         after = sum(1 for r in ran if (r.get("verify") or r["first"])["passed"])
-        total = first_cost + sum((r.get("verify") or {}).get("dollars", 0) for r in ran)
+        total = first_cost + sum((r.get("verify") or {}).get("dollars", 0) + (r.get("contract") or {}).get("dollars", 0)
+                                 for r in ran)
         line += (f"; after the check {after}/{n} ({after / max(n, 1):.0%}), ${total:.4f} total"
                  f" = ${total / max(after, 1):.4f} per completed task (first turn alone: ${first_cost / max(first_pass, 1):.4f})")
     blocked = sum(1 for r in ran for e in r["first"]["gate"] if e.get("action") == "BLOCK_ACTION")
@@ -299,6 +341,9 @@ async def main() -> None:
     parser.add_argument("--max-turns", type=int, default=40, help="tool-call rounds before the SDK stops a run")
     parser.add_argument("--concurrency", type=int, default=3)
     parser.add_argument("--batch", help="tag runs with this name and skip tasks already recorded under it")
+    parser.add_argument("--contract", choices=["auto"], help="write a contract with --model, check it when the run "
+                        "ends, and fix only what fails (on --verify-model if given, else the same model)")
+    parser.add_argument("--max-fixes", type=int, default=1, help="fix rounds for a failed contract")
     args = parser.parse_args()
     if args.task:
         chosen = [s for s in SCENARIOS if s["id"] == args.task]
@@ -330,7 +375,7 @@ async def main() -> None:
           + f", {args.concurrency} at a time", flush=True)
     results = done + list(await asyncio.gather(*(run_task(s, args, client, sem) for s in chosen)))
     if len(results) > 1:
-        print(summary(results, bool(args.verify_model)), flush=True)
+        print(summary(results, bool(args.verify_model or args.contract)), flush=True)
     print(f"\nlog: {RUNS / 'runs.jsonl'}")
 
 

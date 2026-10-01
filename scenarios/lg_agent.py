@@ -41,8 +41,8 @@ except ImportError:  # pragma: no cover
 
 from scenarios.outcomes import evaluate
 from scenarios.run_suite import MODELS
-from scenarios.sdk_agent import (INSTRUCTIONS, OUTPUT_LIMIT, RUNS, Sandbox, dollars, gate_summary, line_for, seed,
-                                 summary, unusable)
+from scenarios.sdk_agent import (INSTRUCTIONS, OUTPUT_LIMIT, RUNS, Sandbox, contract_record, dollars, gate_summary,
+                                 line_for, seed, summary, unusable)
 from scenarios.suite import SCENARIOS
 
 
@@ -161,19 +161,27 @@ async def run_task(scenario: dict, args, sem: asyncio.Semaphore) -> dict:
             try:
                 events: list[dict] = []
                 xyb = Xybernetex(mode="enforce", preset="recommended", approvals=False, log=events.append,
-                                 followups={"mode": "act" if args.verify_model else "observe"})
+                                 followups={"mode": "act" if args.verify_model or args.contract else "observe"})
+                first: dict = {}
+
+                async def grade_first(rep):
+                    # Graded here, before any check or follow-up can change the folder.
+                    first["reply"] = reply_of(rep.result)
+                    first["grade"] = await asyncio.to_thread(evaluate, scenario, folder, first["reply"])
                 tools = make_tools(folder, sandbox)
                 graph = create_react_agent(chat_model(args.model), tools=xyb.tool_node(tools), prompt=INSTRUCTIONS)
                 follow = (create_react_agent(chat_model(args.verify_model), tools=xyb.tool_node(tools), prompt=INSTRUCTIONS)
                           if args.verify_model else None)
                 config = {"configurable": {"thread_id": folder.name}, "recursion_limit": 2 * args.max_turns + 1}
                 report = await xyb.run(graph, scenario["prompt"], config=config, followup_graph=follow,
-                                       model=MODELS[args.model][0])
+                                       model=MODELS[args.model][0], contract=args.contract,
+                                       contract_model=chat_model(args.model) if args.contract else None,
+                                       run_checks=sandbox.check if args.contract else None,
+                                       max_fixes=args.max_fixes, after_first=grade_first)
             finally:
                 await asyncio.to_thread(sandbox.close)
             out["seconds"] = round(time.time() - t0, 1)
-            reply = reply_of(report.result)
-            grade = await asyncio.to_thread(evaluate, scenario, folder, reply)
+            reply, grade = first["reply"], first["grade"]
             usage = usage_of(report.result)
             out["first"] = {"status": report.status, "error": report.error, "seconds": report.seconds, "usage": usage,
                             "dollars": round(dollars(usage, MODELS[args.model][0]), 5), "passed": grade.task,
@@ -183,10 +191,13 @@ async def run_task(scenario: dict, args, sem: asyncio.Semaphore) -> dict:
                 reply2 = reply_of(report.followup)
                 grade2 = await asyncio.to_thread(evaluate, scenario, folder, reply2)
                 usage2 = usage_of(report.followup)
-                out["verify"] = {"model": args.verify_model, "action": (report.decision or {}).get("action"),
+                follow_model = args.verify_model or args.model
+                out["verify"] = {"model": follow_model, "action": (report.decision or {}).get("rule"),
                                  "usage": usage2, "passed": grade2.task, "detail": grade2.detail,
-                                 "dollars": round(dollars(usage2, MODELS[args.verify_model][0]), 5),
+                                 "dollars": round(dollars(usage2, MODELS[follow_model][0]), 5),
                                  "reply": (reply2 or "")[-600:]}
+            if args.contract:
+                out["contract"] = contract_record(report, args.model)
         except Exception as e:  # noqa: BLE001 - one task's crash is a result, not the end of the batch
             out["seconds"] = round(time.time() - t0, 1)
             out["crash"] = f"{type(e).__name__}: {e}"[:300]
@@ -207,6 +218,9 @@ async def main() -> None:
     parser.add_argument("--max-turns", type=int, default=40, help="model/tool rounds before LangGraph stops a run")
     parser.add_argument("--concurrency", type=int, default=3)
     parser.add_argument("--batch", help="tag runs with this name and skip tasks already recorded under it")
+    parser.add_argument("--contract", choices=["auto"], help="write a contract with --model, check it when the run "
+                        "ends, and fix only what fails (on --verify-model if given, else the same model)")
+    parser.add_argument("--max-fixes", type=int, default=1, help="fix rounds for a failed contract")
     args = parser.parse_args()
     if args.task:
         chosen = [s for s in SCENARIOS if s["id"] == args.task]
@@ -236,7 +250,7 @@ async def main() -> None:
           + f", {args.concurrency} at a time", flush=True)
     results = done + list(await asyncio.gather(*(run_task(s, args, sem) for s in chosen)))
     if len(results) > 1:
-        print(summary(results, bool(args.verify_model)), flush=True)
+        print(summary(results, bool(args.verify_model or args.contract)), flush=True)
     print(f"\nlog: {RUNS / 'runs.jsonl'}")
 
 
