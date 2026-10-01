@@ -147,3 +147,14 @@ teacher labels. Split future datasets by whole run before training.
 ```bash
 python -m unittest discover -s tests
 ```
+
+## Benchmarks and data
+
+The runners in `scenarios/` drive our own tasks and Terminal-Bench. No
+Terminal-Bench task content or run logs are in this repo: those tasks carry a
+canary asking that they never appear in public data, so `scenarios/batches/`
+is git-ignored and stays local. Fetch Terminal-Bench yourself to reproduce.
+
+## License
+
+MIT, see `LICENSE`.
