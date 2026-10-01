@@ -74,12 +74,34 @@ PRICE = {
 }
 
 
+def fail_fast_on_timeouts() -> None:
+    """Don't retry a 408. The OpenAI client retries a request timeout like a rate
+    limit, but on Workers AI a 408 means the model deliberated past the ~4-minute
+    request limit, and a retry deliberates again: in lg-hard3-check two tasks spent
+    ~44 minutes each on 10 retries before dying anyway. Failing fast hands the dead
+    run to the follow-up (a retry, maybe on a stronger model) right away. 429s and
+    5xx still retry. Covers LangChain's ChatOpenAI too, which uses this client.
+    (Client-side timeouts are still retried; both runners' timeouts are longer than
+    Workers AI's, so its 408 arrives first.)"""
+    from openai._base_client import BaseClient
+    if getattr(BaseClient._should_retry, "_xybernetex", False):
+        return
+    original = BaseClient._should_retry
+
+    def should_retry(self, response) -> bool:
+        return False if response.status_code == 408 else original(self, response)
+
+    should_retry._xybernetex = True
+    BaseClient._should_retry = should_retry
+
+
 def client_from_env() -> AsyncOpenAI:
     account, key = os.environ.get("CF_ACCOUNT_ID"), os.environ.get("CF_WORKERS_AI_KEY")
     if not account or not key:
         sys.exit("set CF_ACCOUNT_ID and CF_WORKERS_AI_KEY in the environment (never in this file)")
     # Workers AI rate-limits requests per minute per model (429): the client waits
-    # (honoring retry-after) and retries rather than failing the run.
+    # (honoring retry-after) and retries rather than failing the run. A 408 doesn't retry.
+    fail_fast_on_timeouts()
     return AsyncOpenAI(base_url=f"https://api.cloudflare.com/client/v4/accounts/{account}/ai/v1", api_key=key,
                        max_retries=10)
 

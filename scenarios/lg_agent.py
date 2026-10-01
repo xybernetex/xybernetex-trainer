@@ -41,7 +41,7 @@ except ImportError:  # pragma: no cover
 
 from scenarios.outcomes import evaluate
 from scenarios.run_suite import MODELS
-from scenarios.sdk_agent import (INSTRUCTIONS, OUTPUT_LIMIT, RUNS, Sandbox, contract_record, dollars, gate_summary,
+from scenarios.sdk_agent import (INSTRUCTIONS, fail_fast_on_timeouts, OUTPUT_LIMIT, RUNS, Sandbox, contract_record, dollars, gate_summary,
                                  line_for, seed, summary, unusable)
 from scenarios.suite import SCENARIOS
 
@@ -50,6 +50,7 @@ def chat_model(short: str) -> ChatOpenAI:
     account, key = os.environ.get("CF_ACCOUNT_ID"), os.environ.get("CF_WORKERS_AI_KEY")
     if not account or not key:
         sys.exit("set CF_ACCOUNT_ID and CF_WORKERS_AI_KEY in the environment (never in this file)")
+    fail_fast_on_timeouts()   # a 408 is a death, not something to wait out
     return ChatOpenAI(model=MODELS[short][0], api_key=key, timeout=300, max_retries=10,  # 429s: wait and retry
                       base_url=f"https://api.cloudflare.com/client/v4/accounts/{account}/ai/v1")
 
