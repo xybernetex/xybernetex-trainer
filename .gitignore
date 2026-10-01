@@ -9,3 +9,6 @@ models/*.pth
 data/*.npz
 out/
 scenarios/batches/
+
+# run_queue.ps1 output (may hold Terminal-Bench task text: never publish)
+scenarios/queue-logs/
