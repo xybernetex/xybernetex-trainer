@@ -128,6 +128,27 @@ class Sandbox:
             return 124, ""
         return p.returncode, p.stdout + ("\n[stderr]\n" + p.stderr if p.stderr.strip() else "")
 
+    # The ratchet's snapshots (xybernetex core/ratchet.py): full copies of the folder inside the container.
+    _snaps = 0
+
+    def _sh(self, script: str) -> None:
+        p = subprocess.run(["docker", "exec", "-w", "/", self.id, "bash", "-c", script], capture_output=True, text=True,
+                           timeout=300)
+        if p.returncode != 0:
+            raise RuntimeError(p.stderr[-300:] or f"exit {p.returncode}")
+
+    def snapshot(self) -> int:
+        self._snaps += 1
+        self._sh(f"rm -rf /tmp/xyb-snap-{self._snaps} && cp -a /workspace /tmp/xyb-snap-{self._snaps}")
+        return self._snaps
+
+    def restore(self, token: int) -> None:
+        # cp -r, not -a: the folder is a host mount, where preserving times on /workspace itself fails.
+        self._sh(f"find /workspace -mindepth 1 -delete && cp -r /tmp/xyb-snap-{int(token)}/. /workspace/")
+
+    def discard(self, token: int) -> None:
+        self._sh(f"rm -rf /tmp/xyb-snap-{int(token)}")
+
     def close(self) -> None:
         subprocess.run(["docker", "rm", "-f", self.id], capture_output=True)
 
@@ -254,6 +275,7 @@ async def run_task(scenario: dict, args, client: AsyncOpenAI, sem: asyncio.Semap
                 report = await xyb.run(agent, scenario["prompt"], session_key=folder.name, max_turns=args.max_turns,
                                        followup_model=model(args.verify_model) if args.verify_model else None,
                                        contract=args.contract, run_checks=sandbox.check if args.contract else None,
+                                       snapshots=sandbox if args.contract and not args.no_ratchet else None,
                                        max_fixes=args.max_fixes, after_first=grade_first)
             finally:
                 await asyncio.to_thread(sandbox.close)
@@ -296,7 +318,7 @@ def contract_record(report, model_short: str) -> dict:
             # Usage for the one writing call isn't split into input and output: priced at the
             # output rate, an upper bound.
             "dollars": round(tokens * out_price / 1e6, 5),
-            "rounds": [v.summary() for v in report.verdicts], "met": report.contract_met}
+            "rounds": [v.summary() for v in report.verdicts], "ratchet": list(report.ratchet), "met": report.contract_met}
 
 
 def line_for(r: dict) -> str:
@@ -344,6 +366,7 @@ async def main() -> None:
     parser.add_argument("--contract", choices=["auto"], help="write a contract with --model, check it when the run "
                         "ends, and fix only what fails (on --verify-model if given, else the same model)")
     parser.add_argument("--max-fixes", type=int, default=1, help="fix rounds for a failed contract")
+    parser.add_argument("--no-ratchet", action="store_true", help="don't snapshot before fix turns or undo regressions")
     args = parser.parse_args()
     if args.task:
         chosen = [s for s in SCENARIOS if s["id"] == args.task]

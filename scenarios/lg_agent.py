@@ -177,6 +177,7 @@ async def run_task(scenario: dict, args, sem: asyncio.Semaphore) -> dict:
                                        model=MODELS[args.model][0], contract=args.contract,
                                        contract_model=chat_model(args.model) if args.contract else None,
                                        run_checks=sandbox.check if args.contract else None,
+                                       snapshots=sandbox if args.contract and not args.no_ratchet else None,
                                        max_fixes=args.max_fixes, after_first=grade_first)
             finally:
                 await asyncio.to_thread(sandbox.close)
@@ -221,6 +222,7 @@ async def main() -> None:
     parser.add_argument("--contract", choices=["auto"], help="write a contract with --model, check it when the run "
                         "ends, and fix only what fails (on --verify-model if given, else the same model)")
     parser.add_argument("--max-fixes", type=int, default=1, help="fix rounds for a failed contract")
+    parser.add_argument("--no-ratchet", action="store_true", help="don't snapshot before fix turns or undo regressions")
     args = parser.parse_args()
     if args.task:
         chosen = [s for s in SCENARIOS if s["id"] == args.task]
