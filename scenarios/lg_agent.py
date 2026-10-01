@@ -161,7 +161,8 @@ async def run_task(scenario: dict, args, sem: asyncio.Semaphore) -> dict:
             try:
                 events: list[dict] = []
                 xyb = Xybernetex(mode="enforce", preset="recommended", approvals=False, log=events.append,
-                                 followups={"mode": "act" if args.verify_model or args.contract else "observe"})
+                                 followups={"mode": "act" if args.verify_model or args.contract else "observe"},
+                                 governor=args.governor)
                 first: dict = {}
 
                 async def grade_first(rep):
@@ -186,7 +187,7 @@ async def run_task(scenario: dict, args, sem: asyncio.Semaphore) -> dict:
             usage = usage_of(report.result)
             out["first"] = {"status": report.status, "error": report.error, "seconds": report.seconds, "usage": usage,
                             "dollars": round(dollars(usage, MODELS[args.model][0]), 5), "passed": grade.task,
-                            "detail": grade.detail, "reply": (reply or "")[-600:], "decision": report.decision,
+                            "detail": grade.detail, "reply": (reply or "")[-600:], "decision": report.decision, "governor": report.governor,
                             "gate": gate_summary(events)}
             if report.followup is not None:
                 reply2 = reply_of(report.followup)
@@ -221,6 +222,7 @@ async def main() -> None:
     parser.add_argument("--batch", help="tag runs with this name and skip tasks already recorded under it")
     parser.add_argument("--contract", choices=["auto"], help="write a contract with --model, check it when the run "
                         "ends, and fix only what fails (on --verify-model if given, else the same model)")
+    parser.add_argument("--governor", choices=["standard"], help="stop runs that spend without progress (core/governor.py)")
     parser.add_argument("--max-fixes", type=int, default=1, help="fix rounds for a failed contract")
     parser.add_argument("--no-ratchet", action="store_true", help="don't snapshot before fix turns or undo regressions")
     args = parser.parse_args()

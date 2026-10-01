@@ -222,7 +222,7 @@ async def run_task(rel: str, args, sem: asyncio.Semaphore) -> dict:
             out["first"] = {"status": "timeout" if report is None else report.status,
                             "error": None if report is None else report.error, "usage": usage,
                             "dollars": round(dollars(usage, MODELS[args.model][0]), 5), "reward": first["reward"],
-                            "decision": report.decision if report else None,
+                            "decision": report.decision if report else None, "governor": report.governor if report else None,
                             "reply": ((fw.reply(report.result) if report and report.result is not None else "") or "")[-600:],
                             "gate": gate_summary(events)}
             followed = report is not None and report.followup is not None
@@ -277,7 +277,8 @@ class SdkFramework:
         from agents import Agent, function_tool
         from xybernetex.openai_agents import Xybernetex
         xyb = Xybernetex(mode="enforce", preset="recommended", approvals=False, log=events.append,
-                         followups={"mode": "act" if args.verify_model or args.contract else "observe"})
+                         followups={"mode": "act" if args.verify_model or args.contract else "observe"},
+                                 governor=args.governor)
         agent = Agent(name="worker", instructions=INSTRUCTIONS, model=self.model(args.model),
                       tools=[function_tool(f) for f in tool_functions(box)])
         return await xyb.run(agent, task_message(task, wd), session_key=f"tb-{uuid.uuid4().hex[:8]}", max_turns=args.max_turns,
@@ -310,7 +311,8 @@ class LangGraphFramework:
         from langgraph.prebuilt import create_react_agent
         from xybernetex.langgraph import Xybernetex
         xyb = Xybernetex(mode="enforce", preset="recommended", approvals=False, log=events.append,
-                         followups={"mode": "act" if args.verify_model or args.contract else "observe"})
+                         followups={"mode": "act" if args.verify_model or args.contract else "observe"},
+                                 governor=args.governor)
         tools = [tool(f) for f in tool_functions(box)]
         graph = create_react_agent(self.model(args.model), tools=xyb.tool_node(tools), prompt=INSTRUCTIONS)
         follow = (create_react_agent(self.model(args.verify_model), tools=xyb.tool_node(tools), prompt=INSTRUCTIONS)
@@ -356,6 +358,7 @@ def main() -> None:
     parser.add_argument("--model", default="glm53f", help=f"short name: {', '.join(MODELS)}")
     parser.add_argument("--verify-model", help="a check-your-work turn on this model after the first turn")
     parser.add_argument("--contract", choices=["auto"], help="write a contract, check it, fix only what fails")
+    parser.add_argument("--governor", choices=["standard"], help="stop runs that spend without progress (core/governor.py)")
     parser.add_argument("--max-fixes", type=int, default=2)
     parser.add_argument("--no-ratchet", action="store_true")
     parser.add_argument("--tasks", help="comma list of task paths, e.g. archive/fix-git")
