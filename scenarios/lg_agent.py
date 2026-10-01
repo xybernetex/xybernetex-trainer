@@ -46,13 +46,13 @@ from scenarios.sdk_agent import (INSTRUCTIONS, fail_fast_on_timeouts, OUTPUT_LIM
 from scenarios.suite import SCENARIOS
 
 
-def chat_model(short: str) -> ChatOpenAI:
+def chat_model(short: str, **settings) -> ChatOpenAI:
     account, key = os.environ.get("CF_ACCOUNT_ID"), os.environ.get("CF_WORKERS_AI_KEY")
     if not account or not key:
         sys.exit("set CF_ACCOUNT_ID and CF_WORKERS_AI_KEY in the environment (never in this file)")
     fail_fast_on_timeouts()   # a 408 is a death, not something to wait out
     return ChatOpenAI(model=MODELS[short][0], api_key=key, timeout=300, max_retries=10,  # 429s: wait and retry
-                      base_url=f"https://api.cloudflare.com/client/v4/accounts/{account}/ai/v1")
+                      base_url=f"https://api.cloudflare.com/client/v4/accounts/{account}/ai/v1", **settings)
 
 
 def make_tools(folder: Path, sandbox: Sandbox) -> list:
@@ -177,7 +177,7 @@ async def run_task(scenario: dict, args, sem: asyncio.Semaphore) -> dict:
                 config = {"configurable": {"thread_id": folder.name}, "recursion_limit": 2 * args.max_turns + 1}
                 report = await xyb.run(graph, scenario["prompt"], config=config, followup_graph=follow,
                                        model=MODELS[args.model][0], contract=args.contract,
-                                       contract_model=chat_model(args.model) if args.contract else None,
+                                       contract_model=chat_model(args.model, reasoning_effort="low") if args.contract else None,  # see sdk_agent
                                        run_checks=sandbox.check if args.contract else None,
                                        snapshots=sandbox if args.contract and not args.no_ratchet else None,
                                        max_fixes=args.max_fixes, after_first=grade_first)

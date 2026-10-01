@@ -276,6 +276,7 @@ class SdkFramework:
     async def run(self, box: Box, task: Task, wd: str, args, events: list, after_first):
         from agents import Agent, function_tool
         from xybernetex.openai_agents import Xybernetex
+        from scenarios.sdk_agent import contract_settings
         xyb = Xybernetex(mode="enforce", preset="recommended", approvals=False, log=events.append,
                          followups={"mode": "act" if args.verify_model or args.contract else "observe"},
                                  governor=args.governor)
@@ -285,7 +286,8 @@ class SdkFramework:
                              followup_model=self.model(args.verify_model) if args.verify_model else None,
                              contract=args.contract, run_checks=box.check if args.contract else None,
                              snapshots=box if args.contract and not args.no_ratchet else None,
-                             max_fixes=args.max_fixes, after_first=after_first)
+                             max_fixes=args.max_fixes, after_first=after_first,
+                             contract_settings=contract_settings() if args.contract else None)
 
     @staticmethod
     def usage(result):
@@ -302,9 +304,9 @@ class LangGraphFramework:
         _credentials()
 
     @staticmethod
-    def model(short: str):
+    def model(short: str, **settings):
         from scenarios.lg_agent import chat_model
-        return chat_model(short)
+        return chat_model(short, **settings)
 
     async def run(self, box: Box, task: Task, wd: str, args, events: list, after_first):
         from langchain_core.tools import tool
@@ -320,7 +322,7 @@ class LangGraphFramework:
         config = {"configurable": {"thread_id": f"tb-{uuid.uuid4().hex[:8]}"}, "recursion_limit": 2 * args.max_turns + 1}
         return await xyb.run(graph, task_message(task, wd), config=config, followup_graph=follow,
                              model=MODELS[args.model][0], contract=args.contract,
-                             contract_model=self.model(args.model) if args.contract else None,
+                             contract_model=self.model(args.model, reasoning_effort="low") if args.contract else None,
                              run_checks=box.check if args.contract else None,
                              snapshots=box if args.contract and not args.no_ratchet else None,
                              max_fixes=args.max_fixes, after_first=after_first)

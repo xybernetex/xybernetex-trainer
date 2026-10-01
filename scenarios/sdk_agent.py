@@ -74,6 +74,15 @@ PRICE = {
 }
 
 
+# Contracts are written at low reasoning effort: on detailed requests GLM-5.3 Flash and DeepSeek V4 Flash
+# deliberated past 8,000+ tokens (or Workers AI's request limit) and wrote nothing; at low effort GLM wrote
+# a contract in ~500 tokens.
+def contract_settings():
+    from agents import ModelSettings
+    from agents.model_settings import Reasoning
+    return ModelSettings(reasoning=Reasoning(effort="low"))
+
+
 def fail_fast_on_timeouts() -> None:
     """Don't retry a 408. The OpenAI client retries a request timeout like a rate
     limit, but on Workers AI a 408 means the model deliberated past the ~4-minute
@@ -299,7 +308,8 @@ async def run_task(scenario: dict, args, client: AsyncOpenAI, sem: asyncio.Semap
                                        followup_model=model(args.verify_model) if args.verify_model else None,
                                        contract=args.contract, run_checks=sandbox.check if args.contract else None,
                                        snapshots=sandbox if args.contract and not args.no_ratchet else None,
-                                       max_fixes=args.max_fixes, after_first=grade_first)
+                                       max_fixes=args.max_fixes, after_first=grade_first,
+                                       contract_settings=contract_settings() if args.contract else None)
             finally:
                 await asyncio.to_thread(sandbox.close)
             out["seconds"] = round(time.time() - t0, 1)
