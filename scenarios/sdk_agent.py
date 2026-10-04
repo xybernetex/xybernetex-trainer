@@ -309,7 +309,11 @@ async def run_task(scenario: dict, args, client: AsyncOpenAI, sem: asyncio.Semap
                                        contract=args.contract, run_checks=sandbox.check if args.contract else None,
                                        snapshots=sandbox if args.contract and not args.no_ratchet else None,
                                        max_fixes=args.max_fixes, after_first=grade_first,
-                                       contract_settings=contract_settings() if args.contract else None)
+                                       contract_settings=contract_settings() if args.contract and args.writer_effort == "low"
+                                       else None,
+                                       contract_version=args.contract_version,
+                                       judge_model=model(args.verify_model or args.model)
+                                       if args.contract and args.contract_version == "v2" else None)
             finally:
                 await asyncio.to_thread(sandbox.close)
             out["seconds"] = round(time.time() - t0, 1)
@@ -329,7 +333,7 @@ async def run_task(scenario: dict, args, client: AsyncOpenAI, sem: asyncio.Semap
                                  "dollars": round(dollars(usage2, MODELS[follow_model][0]), 5),
                                  "reply": (reply2 or "")[-600:]}
             if args.contract:
-                out["contract"] = contract_record(report, args.model)
+                out["contract"] = contract_record(report, args.model, args.verify_model or args.model)
         except Exception as e:  # noqa: BLE001 - one task's crash is a result, not the end of the batch
             out["seconds"] = round(time.time() - t0, 1)
             out["crash"] = f"{type(e).__name__}: {e}"[:300]
@@ -341,17 +345,22 @@ async def run_task(scenario: dict, args, client: AsyncOpenAI, sem: asyncio.Semap
         return out
 
 
-def contract_record(report, model_short: str) -> dict:
-    """What the contract arm did: the contract, every check round, and what writing it cost."""
+def contract_record(report, model_short: str, judge_short: str | None = None) -> dict:
+    """What the contract arm did: the contract, every check round, and what writing it (and, in v2,
+    judging it) cost."""
     c = report.contract
     tokens = report.contract_tokens or 0
     _, _, out_price = PRICE.get(MODELS[model_short][0], (0, 0, 0))
+    judge_tokens = getattr(report, "judge_tokens", 0) or 0
+    _, _, judge_price = PRICE.get(MODELS[judge_short or model_short][0], (0, 0, 0))
     return {"available": c is not None, "source": c.source if c else None, "checks": len(c.checks) if c else 0,
             "refused": len(c.refused) if c else 0, "hash": c.hash if c else None, "tokens": tokens,
             # Usage for the one writing call isn't split into input and output: priced at the
             # output rate, an upper bound.
-            "dollars": round(tokens * out_price / 1e6, 5),
-            "rounds": [v.summary() for v in report.verdicts], "ratchet": list(report.ratchet), "met": report.contract_met}
+            "dollars": round(tokens * out_price / 1e6 + judge_tokens * judge_price / 1e6, 5),
+            "rounds": [v.summary() for v in report.verdicts], "ratchet": list(report.ratchet), "met": report.contract_met,
+            "judgments": list(getattr(report, "judgments", [])), "judge_tokens": judge_tokens,
+            "overturned": getattr(c, "overturned", 0) if c else 0}
 
 
 def line_for(r: dict) -> str:
@@ -401,6 +410,12 @@ async def main() -> None:
     parser.add_argument("--governor", choices=["standard"], help="stop runs that spend without progress (core/governor.py)")
     parser.add_argument("--max-fixes", type=int, default=1, help="fix rounds for a failed contract")
     parser.add_argument("--no-ratchet", action="store_true", help="don't snapshot before fix turns or undo regressions")
+    parser.add_argument("--contract-version", choices=["v1", "v2"], default="v1",
+                        help="v2: checks must quote the request, a judge (--verify-model, else --model) rules on "
+                             "failed checks before any fix, and the agent may dispute a check")
+    parser.add_argument("--writer-effort", choices=["low", "normal"], default="low",
+                        help="reasoning effort for the contract writer (low: GLM wrote nothing at normal effort on "
+                             "detailed tasks; normal is the control for that choice)")
     args = parser.parse_args()
     if args.task:
         chosen = [s for s in SCENARIOS if s["id"] == args.task]

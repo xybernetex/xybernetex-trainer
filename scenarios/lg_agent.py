@@ -177,7 +177,12 @@ async def run_task(scenario: dict, args, sem: asyncio.Semaphore) -> dict:
                 config = {"configurable": {"thread_id": folder.name}, "recursion_limit": 2 * args.max_turns + 1}
                 report = await xyb.run(graph, scenario["prompt"], config=config, followup_graph=follow,
                                        model=MODELS[args.model][0], contract=args.contract,
-                                       contract_model=chat_model(args.model, reasoning_effort="low") if args.contract else None,  # see sdk_agent
+                                       contract_model=(chat_model(args.model, **({"reasoning_effort": "low"}
+                                                       if args.writer_effort == "low" else {})))
+                                       if args.contract else None,  # see sdk_agent
+                                       contract_version=args.contract_version,
+                                       judge_model=chat_model(args.verify_model or args.model)
+                                       if args.contract and args.contract_version == "v2" else None,
                                        run_checks=sandbox.check if args.contract else None,
                                        snapshots=sandbox if args.contract and not args.no_ratchet else None,
                                        max_fixes=args.max_fixes, after_first=grade_first)
@@ -200,7 +205,7 @@ async def run_task(scenario: dict, args, sem: asyncio.Semaphore) -> dict:
                                  "dollars": round(dollars(usage2, MODELS[follow_model][0]), 5),
                                  "reply": (reply2 or "")[-600:]}
             if args.contract:
-                out["contract"] = contract_record(report, args.model)
+                out["contract"] = contract_record(report, args.model, args.verify_model or args.model)
         except Exception as e:  # noqa: BLE001 - one task's crash is a result, not the end of the batch
             out["seconds"] = round(time.time() - t0, 1)
             out["crash"] = f"{type(e).__name__}: {e}"[:300]
@@ -226,6 +231,12 @@ async def main() -> None:
     parser.add_argument("--governor", choices=["standard"], help="stop runs that spend without progress (core/governor.py)")
     parser.add_argument("--max-fixes", type=int, default=1, help="fix rounds for a failed contract")
     parser.add_argument("--no-ratchet", action="store_true", help="don't snapshot before fix turns or undo regressions")
+    parser.add_argument("--contract-version", choices=["v1", "v2"], default="v1",
+                        help="v2: checks must quote the request, a judge (--verify-model, else --model) rules on "
+                             "failed checks before any fix, and the agent may dispute a check")
+    parser.add_argument("--writer-effort", choices=["low", "normal"], default="low",
+                        help="reasoning effort for the contract writer (low: GLM wrote nothing at normal effort on "
+                             "detailed tasks; normal is the control for that choice)")
     args = parser.parse_args()
     if args.task:
         chosen = [s for s in SCENARIOS if s["id"] == args.task]
