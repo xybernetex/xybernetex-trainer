@@ -16,7 +16,8 @@ Runs the pending experiment batches one after another, unattended.
 - Output: scenarios\queue-logs\<batch>.log per batch, and a summary at the end.
 #>
 param(
-    [switch]$IncludeTerminalBench   # adds the Terminal-Bench batches: many hours
+    [switch]$IncludeTerminalBench,  # adds the Terminal-Bench batches: many hours
+    [string]$Set = "default"        # default | contracts2 (contract v2 against the v1 normal-effort control)
 )
 
 $ErrorActionPreference = "Continue"
@@ -45,6 +46,14 @@ $queue = @(
     @("sdk-hard3-contract", "scenarios.sdk_agent", "--category hard3 --model glm53f --verify-model dsv4p --contract auto"),
     @("lg-hard2-r2",        "scenarios.lg_agent",  "--category hard2 --model glm53f")
 )
+if ($Set -eq "contracts2") {
+    $queue = @(
+        @("lg-hard3-contract2",        "scenarios.lg_agent",  "--category hard3 --model glm53f --verify-model dsv4p --contract auto --contract-version v2"),
+        @("sdk-hard3-contract2",       "scenarios.sdk_agent", "--category hard3 --model glm53f --verify-model dsv4p --contract auto --contract-version v2"),
+        @("lg-hard3-contract-normal",  "scenarios.lg_agent",  "--category hard3 --model glm53f --verify-model dsv4p --contract auto --writer-effort normal"),
+        @("sdk-hard3-contract-normal", "scenarios.sdk_agent", "--category hard3 --model glm53f --verify-model dsv4p --contract auto --writer-effort normal")
+    )
+}
 if ($IncludeTerminalBench) {
     $queue += ,@("tbpy-sdk-survey", "scenarios.tb_py", "--framework sdk --model glm53f --from-survey")
     $queue += ,@("tbpy-lg-survey",  "scenarios.tb_py", "--framework langgraph --model glm53f --from-survey")
